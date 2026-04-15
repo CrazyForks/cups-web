@@ -28,7 +28,7 @@
 
       <div class="overflow-x-auto mt-4">
         <UTable :columns="userColumns" :data="users">
-          <template #actions-data="{ row }">
+          <template #actions-cell="{ row }">
             <div class="flex gap-2">
               <UButton size="xs" variant="ghost" @click="editUser(row)">编辑</UButton>
               <UButton size="xs" variant="outline" color="error" :disabled="row.username === 'admin'" @click="deleteUser(row)">删除</UButton>
@@ -53,7 +53,7 @@
       </div>
       <div class="overflow-x-auto">
         <UTable :columns="printColumns" :data="printRecords">
-          <template #download-data="{ row }">
+          <template #download-cell="{ row }">
             <UButton size="xs" variant="ghost" :href="`/api/print-records/${row.id}/file`" target="_blank" icon="i-lucide-download">下载</UButton>
           </template>
         </UTable>
