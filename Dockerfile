@@ -5,6 +5,14 @@ RUN bun install
 COPY frontend ./
 RUN bun run build
 
+# ---- Java OFD converter build ----
+FROM maven:3.9-eclipse-temurin-17 AS java-builder
+WORKDIR /src/ofd-converter
+COPY ofd-converter/pom.xml ./
+RUN mvn dependency:go-offline -q
+COPY ofd-converter/src ./src
+RUN mvn clean package -q -DskipTests
+
 FROM golang:1.24 AS builder
 WORKDIR /src
 
@@ -44,6 +52,7 @@ ENV HOME=/home/nonroot
 ENV XDG_CACHE_HOME=/home/nonroot/.cache
 
 COPY --from=builder /out/cups-web /cups-web
+COPY --from=java-builder /src/ofd-converter/target/ofd-converter.jar /ofd-converter.jar
 EXPOSE 8080
 USER nonroot
 ENTRYPOINT ["/cups-web"]

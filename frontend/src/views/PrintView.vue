@@ -54,7 +54,7 @@
               <div v-if="!selectedFile">
                 <UIcon name="i-lucide-upload-cloud" class="w-8 h-8 sm:w-10 sm:h-10 mx-auto text-muted mb-2" />
                 <p class="text-sm text-muted">点击或拖拽文件上传</p>
-                <p class="text-xs text-muted mt-1">支持 PDF、Word、Excel、PPT、图片等格式</p>
+                <p class="text-xs text-muted mt-1">支持 PDF、Word、Excel、PPT、OFD、图片等格式</p>
               </div>
               <div v-else class="flex items-center gap-3 w-full">
                 <UIcon name="i-lucide-file-check" class="w-8 h-8 text-success shrink-0" />
@@ -701,6 +701,10 @@ function isOfficeFile(f) {
   ].includes(f.type)
 }
 
+function isOFDFile(f) {
+  return /\.ofd$/i.test(f.name)
+}
+
 // ─── 文件操作 ─────────────────────────────────────────────
 function clearFile() {
   if (previewUrl.value) {
@@ -743,6 +747,9 @@ function processFile(f) {
   } else if (isOfficeFile(f)) {
     previewType.value = 'text'
     textPreview.value = 'Office 文档（无法直接预览）。点击"转换为 PDF"生成预览。'
+  } else if (isOFDFile(f)) {
+    previewType.value = 'text'
+    textPreview.value = 'OFD文件（开放版式文档）无法直接预览。点击"转换为PDF"生成预览。'
   } else if (f.type.startsWith('text/') || /\.(txt|md|html)$/i.test(f.name)) {
     const reader = new FileReader()
     reader.onload = () => {
@@ -800,7 +807,7 @@ async function convertToPdf() {
   try {
     const f = selectedFile.value
     let blob
-    if (isOfficeFile(f)) {
+    if (isOfficeFile(f) || isOFDFile(f)) {
       blob = await convertOfficeToPdf(f)
     } else if (f.type.startsWith('image/')) {
       blob = await imageFileToPdfBlob(f)

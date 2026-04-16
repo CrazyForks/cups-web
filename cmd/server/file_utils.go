@@ -21,6 +21,7 @@ const (
 	fileKindImage  fileKind = "image"
 	fileKindText   fileKind = "text"
 	fileKindOffice fileKind = "office"
+	fileKindOFD    fileKind = "ofd"
 	fileKindOther  fileKind = "other"
 )
 
@@ -152,6 +153,9 @@ func detectFileKind(path string, name string) fileKind {
 	if ext == ".pdf" {
 		return fileKindPDF
 	}
+	if ext == ".ofd" {
+		return fileKindOFD
+	}
 	if isOfficeFile(name) {
 		return fileKindOffice
 	}
@@ -198,6 +202,14 @@ func countPages(ctx context.Context, path string, name string) (int, bool, error
 		return pages, true, err
 	case fileKindOffice:
 		outPath, cleanup, err := convertOfficeToPDF(ctx, path)
+		if err != nil {
+			return 0, false, err
+		}
+		defer cleanup()
+		pages, err := countPDFPages(outPath)
+		return pages, false, err
+	case fileKindOFD:
+		outPath, cleanup, err := convertOFDToPDF(ctx, path)
 		if err != nil {
 			return 0, false, err
 		}

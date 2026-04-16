@@ -35,6 +35,8 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	var outCleanup func()
 	if kind == fileKindText {
 		outPath, outCleanup, err = convertTextToPDF(inPath)
+	} else if kind == fileKindOFD {
+		outPath, outCleanup, err = convertOFDToPDF(ctx, inPath)
 	} else {
 		outPath, outCleanup, err = convertOfficeToPDF(ctx, inPath)
 	}

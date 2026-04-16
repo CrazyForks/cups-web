@@ -107,6 +107,30 @@ func printHandler(w http.ResponseWriter, r *http.Request) {
 		printPath = convertedAbs
 		printCleanup = cleanup
 		printMime = "application/pdf"
+	case fileKindOFD:
+		outPath, cleanup, err := convertOFDToPDF(countCtx, storedAbs)
+		if err != nil {
+			_ = os.Remove(storedAbs)
+			writeJSONError(w, http.StatusBadRequest, "conversion failed")
+			return
+		}
+		pages, err = countPDFPages(outPath)
+		if err != nil {
+			cleanup()
+			_ = os.Remove(storedAbs)
+			writeJSONError(w, http.StatusBadRequest, "failed to read pages")
+			return
+		}
+		_, convertedAbs, err := saveConvertedPDFToUploads(outPath, storedRel, uploadDir)
+		if err != nil {
+			cleanup()
+			_ = os.Remove(storedAbs)
+			writeJSONError(w, http.StatusInternalServerError, "failed to save converted file")
+			return
+		}
+		printPath = convertedAbs
+		printCleanup = cleanup
+		printMime = "application/pdf"
 	case fileKindImage:
 		outPath, cleanup, err := convertImageToPDF(storedAbs)
 		if err != nil {

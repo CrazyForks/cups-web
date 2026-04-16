@@ -27,4 +27,7 @@ uploads/
 # Go
 vendor/
 
+# Maven
+ofd-converter/target/
+
 .aone_copilot/

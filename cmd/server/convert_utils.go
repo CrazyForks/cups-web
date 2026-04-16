@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-
 func convertOfficeToPDF(ctx context.Context, inputPath string) (string, func(), error) {
 	tmpDir, err := os.MkdirTemp("", "convert-")
 	if err != nil {
@@ -35,6 +34,35 @@ func convertOfficeToPDF(ctx context.Context, inputPath string) (string, func(), 
 			return "", nil, fmt.Errorf("conversion produced no PDF")
 		}
 		outPath = matches[0]
+	}
+
+	return outPath, cleanup, nil
+}
+
+func convertOFDToPDF(ctx context.Context, inputPath string) (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "convert-ofd-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	outPath := filepath.Join(tmpDir, "output.pdf")
+
+	jarPath := os.Getenv("OFD_CONVERTER_JAR")
+	if jarPath == "" {
+		jarPath = "/ofd-converter.jar"
+	}
+
+	cmd := exec.CommandContext(ctx, "java", "-Xmx512m", "-jar", jarPath, inputPath, outPath)
+	cmd.Env = append(os.Environ(), "LANG=zh_CN.UTF-8", "LC_ALL=zh_CN.UTF-8")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("OFD to PDF conversion failed: %w - %s", err, string(out))
+	}
+
+	if _, err := os.Stat(outPath); os.IsNotExist(err) {
+		cleanup()
+		return "", nil, fmt.Errorf("OFD to PDF conversion produced no output")
 	}
 
 	return outPath, cleanup, nil
