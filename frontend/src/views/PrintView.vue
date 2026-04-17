@@ -763,17 +763,46 @@ function processFile(f) {
   }
 }
 
-async function imageFileToPdfBlob(file) {
+async function imageFileToPdfBlob(file, orient, pSize) {
   return new Promise((resolve, reject) => {
     const img = new Image()
     img.onload = () => {
-      const canvas = document.createElement('canvas')
-      canvas.width = img.width
-      canvas.height = img.height
-      canvas.getContext('2d').drawImage(img, 0, 0)
-      const imgData = canvas.toDataURL('image/jpeg', 1.0)
-      const doc = new jsPDF({ unit: 'px', format: [img.width, img.height] })
-      doc.addImage(imgData, 'JPEG', 0, 0, img.width, img.height)
+      // 获取纸张尺寸
+      const dims = paperDimensionsMap[pSize] || { width: 210, height: 297 }
+      const isLandscape = orient === 'landscape'
+
+      // jsPDF orientation: 'p' = portrait, 'l' = landscape
+      const doc = new jsPDF({
+        orientation: isLandscape ? 'l' : 'p',
+        unit: 'mm',
+        format: [dims.width, dims.height]  // 始终传入纵向的 [宽, 高]，jsPDF 会根据 orientation 自动调整
+      })
+
+      // 获取实际页面可用尺寸
+      const pageWidth = doc.internal.pageSize.getWidth()
+      const pageHeight = doc.internal.pageSize.getHeight()
+
+      // 计算边距
+      const margin = 10 // mm
+      const maxW = pageWidth - margin * 2
+      const maxH = pageHeight - margin * 2
+
+      // 计算图片缩放比例，保持宽高比
+      const imgRatio = img.width / img.height
+      let drawW, drawH
+      if (imgRatio > maxW / maxH) {
+        drawW = maxW
+        drawH = maxW / imgRatio
+      } else {
+        drawH = maxH
+        drawW = maxH * imgRatio
+      }
+
+      // 居中放置
+      const x = margin + (maxW - drawW) / 2
+      const y = margin + (maxH - drawH) / 2
+
+      doc.addImage(img, 'JPEG', x, y, drawW, drawH)
       resolve(doc.output('blob'))
     }
     img.onerror = () => reject(new Error('图片加载失败'))
@@ -781,10 +810,22 @@ async function imageFileToPdfBlob(file) {
   })
 }
 
-function textToPdfBlob(text) {
-  const doc = new jsPDF()
-  const lines = doc.splitTextToSize(text || '', 180)
-  doc.text(lines, 10, 10)
+function textToPdfBlob(text, orient, pSize) {
+  const dims = paperDimensionsMap[pSize] || { width: 210, height: 297 }
+  const isLandscape = orient === 'landscape'
+
+  const doc = new jsPDF({
+    orientation: isLandscape ? 'l' : 'p',
+    unit: 'mm',
+    format: [dims.width, dims.height]
+  })
+
+  const pageWidth = doc.internal.pageSize.getWidth()
+  const margin = 15
+  const maxWidth = pageWidth - margin * 2
+
+  const lines = doc.splitTextToSize(text || '', maxWidth)
+  doc.text(lines, margin, margin)
   return doc.output('blob')
 }
 
@@ -810,10 +851,10 @@ async function convertToPdf() {
     if (isOfficeFile(f) || isOFDFile(f)) {
       blob = await convertOfficeToPdf(f)
     } else if (f.type.startsWith('image/')) {
-      blob = await imageFileToPdfBlob(f)
+      blob = await imageFileToPdfBlob(f, orientation.value, paperSize.value)
     } else {
       const text = await f.text()
-      blob = textToPdfBlob(text)
+      blob = textToPdfBlob(text, orientation.value, paperSize.value)
     }
     pdfBlob.value = blob
     if (previewUrl.value) try { URL.revokeObjectURL(previewUrl.value) } catch (_) {}

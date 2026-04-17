@@ -20,6 +20,10 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	// 读取方向和纸张大小参数
+	orientation := r.FormValue("orientation")
+	paperSize := r.FormValue("paper_size")
+
 	inPath, cleanup, err := saveTempUpload(file, fh.Filename)
 	if err != nil {
 		http.Error(w, "failed to save file", http.StatusInternalServerError)
@@ -34,7 +38,7 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	var outPath string
 	var outCleanup func()
 	if kind == fileKindText {
-		outPath, outCleanup, err = convertTextToPDF(inPath)
+		outPath, outCleanup, err = convertTextToPDF(inPath, orientation, paperSize)
 	} else if kind == fileKindOFD {
 		outPath, outCleanup, err = convertOFDToPDF(ctx, inPath)
 	} else {
