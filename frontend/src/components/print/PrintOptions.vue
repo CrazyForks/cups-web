@@ -88,6 +88,34 @@
         </label>
       </UFormField>
 
+      <!-- 预览 -->
+      <template v-if="selectedFile">
+        <div class="border-t border-default pt-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2 font-semibold">
+              <UIcon name="i-lucide-eye" class="w-5 h-5" />
+              预览
+            </div>
+            <span class="text-sm text-muted">
+              {{ paperSizeLabel }} · {{ orientationLabel }} · {{ paperDimText }}
+            </span>
+          </div>
+          <div class="flex justify-center items-center py-4 bg-elevated rounded-lg" style="min-height: 200px;">
+            <div :style="paperPreviewStyle"
+                 class="bg-white shadow-lg border border-default overflow-hidden transition-all duration-300 ease-in-out relative max-h-[250px] sm:max-h-[350px] md:max-h-[400px]">
+              <img v-if="previewType === 'image'" :src="previewUrl" class="w-full h-full object-contain" />
+              <PdfCanvas v-else-if="previewType === 'pdf'" :src="previewUrl" />
+              <div v-else-if="previewType === 'text'" class="p-3 text-[8px] leading-tight overflow-hidden h-full text-gray-700 dark:text-gray-300 whitespace-pre-wrap">
+                {{ textPreview?.substring(0, 800) }}
+              </div>
+              <div v-else class="flex items-center justify-center h-full text-muted text-sm">
+                {{ paperSizeLabel }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
       <!-- 打印按钮 -->
       <UButton
         color="primary"
@@ -106,6 +134,7 @@
 
 <script setup>
 import { ref } from 'vue'
+import PdfCanvas from './PdfCanvas.vue'
 
 const props = defineProps({
   isColor: { type: Boolean, default: true },
@@ -119,7 +148,14 @@ const props = defineProps({
   mirror: { type: Boolean, default: false },
   printing: { type: Boolean, default: false },
   canPrint: { type: Boolean, default: false },
-  selectedFile: { type: [File, null], default: null }
+  selectedFile: { type: [File, null], default: null },
+  previewUrl: { type: String, default: '' },
+  previewType: { type: String, default: '' },
+  textPreview: { type: String, default: '' },
+  paperSizeLabel: { type: String, default: '' },
+  orientationLabel: { type: String, default: '' },
+  paperDimText: { type: String, default: '' },
+  paperPreviewStyle: { type: Object, default: () => ({}) }
 })
 
 const emit = defineEmits([

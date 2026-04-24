@@ -42,20 +42,14 @@
           :printing="printing"
           :can-print="canPrint"
           :selected-file="selectedFile"
-          @print="uploadAndPrint"
-        />
-        <PaperPreview
-          v-if="selectedFile"
-          :selected-file="selectedFile"
           :preview-url="previewUrl"
           :preview-type="previewType"
           :text-preview="textPreview"
-          :paper-size="paperSize"
-          :orientation="orientation"
           :paper-size-label="paperSizeLabel"
           :orientation-label="orientationLabel"
           :paper-dim-text="paperDimText"
           :paper-preview-style="paperPreviewStyle"
+          @print="uploadAndPrint"
         />
       </div>
 
@@ -76,7 +70,6 @@ import { isOfficeFile, isOFDFile } from '../utils/file'
 import PrinterSelector from '../components/print/PrinterSelector.vue'
 import FileUpload from '../components/print/FileUpload.vue'
 import PrintOptions from '../components/print/PrintOptions.vue'
-import PaperPreview from '../components/print/PaperPreview.vue'
 import PrintRecordList from '../components/print/PrintRecordList.vue'
 import PrinterStatus from '../components/print/PrinterStatus.vue'
 
