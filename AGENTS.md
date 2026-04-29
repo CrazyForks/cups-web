@@ -31,7 +31,7 @@
 | UI 库 | `@nuxt/ui` v4（含自带的 Tailwind 主题） |
 | 样式 | Tailwind CSS v4 |
 | 图标 | `@iconify-json/lucide` |
-| PDF 处理 | `jspdf`（生成）、`pdfjs-dist`（预览） |
+| PDF 处理 | `pdfjs-dist`（预览，PDF 生成统一交由后端 `/api/convert`） |
 | HEIC 兼容 | `heic2any` |
 | 包管理 | Bun（推荐） |
 
@@ -129,7 +129,7 @@ cups-web/
 | GET | `/api/printers` | 列出 CUPS 中的打印机 |
 | GET | `/api/printer-info?uri=<uri>` | 查询打印机属性（状态、队列任务数等） |
 | POST | `/api/estimate` | 上传文件，返回估算页数 |
-| POST | `/api/convert` | 上传文件，返回转换后的 PDF 流 |
+| POST | `/api/convert` | 上传文件，返回转换后的 PDF 流；支持单文件（`file` 字段，PDF / Office / OFD / 图片 / 文本）与多图合并（`files` 字段，多张图合成单个 PDF） |
 | POST | `/api/print` | 提交打印任务 |
 | GET | `/api/print-records` | 查询自己的打印记录（可带 `start` / `end`） |
 | GET | `/api/print-records/{id}/file` | 下载打印记录对应的原始文件 |
@@ -302,7 +302,7 @@ Vite 已配置 `manualChunks`：
 
 - `vue-vendor`：vue / vue-router
 - `ui-vendor`：`@nuxt/ui` / `reka-ui` / `@vueuse`
-- `pdf-vendor`：`jspdf` / `pdfjs-dist`
+- `pdf-vendor`：`pdfjs-dist`（仅预览，PDF 生成已迁移到后端）
 
 ## 🚢 部署
 
@@ -361,7 +361,7 @@ Vite 已配置 `manualChunks`：
 1. 在 `file_utils.go::detectFileKind` 加入新的 `fileKind`
 2. 实现转换函数（放 `convert_utils.go` 或 `pdf_utils.go`）
 3. 在 `print_handlers.go` 的 `switch kind` 中处理新类型
-4. 同步更新 `estimateHandler` / `convertHandler` 中的分支
+4. 同步更新 `estimateHandler` / `convertHandler` 中的分支（`convertHandler` 需覆盖单文件 `file` 与多文件 `files` 两种入口）
 
 ## 🧪 调试与测试
 

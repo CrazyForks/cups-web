@@ -7,9 +7,12 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"math"
+	"mime/multipart"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/phpdave11/gofpdf"
 )
@@ -203,4 +206,135 @@ func convertTextToPDF(inputPath string, orientation string, paperSize string) (s
 		return "", nil, err
 	}
 	return outPath, cleanup, nil
+}
+
+// convertImagesMultiToPDF 将多张图片合并为单个 PDF。
+// 每张图片占据一页，按等比例缩放居中绘制，页面大小与方向由 orientation / paperSize 决定。
+// 调用方负责在使用完输出 PDF 后调用返回的 cleanup 清理临时目录。
+func convertImagesMultiToPDF(fileHeaders []*multipart.FileHeader, orientation string, paperSize string) (string, func(), error) {
+	if len(fileHeaders) == 0 {
+		return "", nil, errors.New("no image files provided")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "convert-imgs-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	// 先把所有上传流落到临时文件，便于 gofpdf 直接读取路径
+	type savedImage struct {
+		path string
+		cfg  image.Config
+	}
+	saved := make([]savedImage, 0, len(fileHeaders))
+	for idx, fh := range fileHeaders {
+		src, err := fh.Open()
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		ext := strings.ToLower(filepath.Ext(fh.Filename))
+		if ext == "" {
+			ext = ".img"
+		}
+		imgPath := filepath.Join(tmpDir, "img_"+itoa(idx)+ext)
+		dst, err := os.Create(imgPath)
+		if err != nil {
+			src.Close()
+			cleanup()
+			return "", nil, err
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			dst.Close()
+			src.Close()
+			cleanup()
+			return "", nil, err
+		}
+		dst.Close()
+		src.Close()
+
+		// 读尺寸
+		f, err := os.Open(imgPath)
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		cfg, _, err := image.DecodeConfig(f)
+		_ = f.Close()
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		if cfg.Width <= 0 || cfg.Height <= 0 {
+			cleanup()
+			return "", nil, errors.New("invalid image dimensions: " + fh.Filename)
+		}
+		saved = append(saved, savedImage{path: imgPath, cfg: cfg})
+	}
+
+	// 构造 PDF
+	orientCode := getOrientationCode(orientation)
+	paperName, customSize := paperSizeToGofpdf(paperSize)
+
+	var pdf *gofpdf.Fpdf
+	if paperName != "" {
+		pdf = gofpdf.New(orientCode, "mm", paperName, "")
+	} else {
+		pdf = gofpdf.NewCustom(&gofpdf.InitType{
+			UnitStr:        "mm",
+			Size:           customSize,
+			OrientationStr: orientCode,
+		})
+	}
+	pdf.SetMargins(pdfPageMarginMM, pdfPageMarginMM, pdfPageMarginMM)
+	pdf.SetAutoPageBreak(false, pdfPageMarginMM)
+
+	for _, img := range saved {
+		pdf.AddPage()
+		pageW, pageH := pdf.GetPageSize()
+		maxW := pageW - 2*pdfPageMarginMM
+		maxH := pageH - 2*pdfPageMarginMM
+		scale := math.Min(maxW/float64(img.cfg.Width), maxH/float64(img.cfg.Height))
+		if scale <= 0 {
+			scale = 1
+		}
+		w := float64(img.cfg.Width) * scale
+		h := float64(img.cfg.Height) * scale
+		x := (pageW - w) / 2
+		y := (pageH - h) / 2
+
+		opts := gofpdf.ImageOptions{ImageType: "", ReadDpi: true}
+		pdf.ImageOptions(img.path, x, y, w, h, false, opts, 0, "")
+	}
+
+	outPath := filepath.Join(tmpDir, "images.pdf")
+	if err := pdf.OutputFileAndClose(outPath); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return outPath, cleanup, nil
+}
+
+// itoa 是一个小助手，避免再引入 strconv 仅为了格式化索引
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
 }

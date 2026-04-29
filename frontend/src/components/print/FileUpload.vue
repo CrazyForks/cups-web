@@ -69,7 +69,7 @@
             @click="$emit('convert')"
           >{{ isMultiImage ? '合并' : '转 PDF' }}</UButton>
           <UButton
-            v-if="previewUrl"
+            v-if="converted && pdfBlob && previewUrl"
             variant="ghost"
             size="xs"
             icon="i-lucide-download"

@@ -23,7 +23,7 @@ export default defineConfig({
           if (id.includes('node_modules/@nuxt/ui') || id.includes('node_modules/reka-ui') || id.includes('node_modules/@vueuse')) {
             return 'ui-vendor'
           }
-          if (id.includes('node_modules/jspdf') || id.includes('node_modules/pdfjs-dist')) {
+          if (id.includes('node_modules/pdfjs-dist')) {
             return 'pdf-vendor'
           }
         }

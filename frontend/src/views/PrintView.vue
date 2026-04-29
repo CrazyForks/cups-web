@@ -140,8 +140,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { jsPDF } from 'jspdf'
-import { getCSRF } from '../utils/api'
+import { apiFetch, readError } from '../utils/api'
 import { isOfficeFile, isOFDFile } from '../utils/file'
 import FileUpload from '../components/print/FileUpload.vue'
 import PrintPreview from '../components/print/PrintPreview.vue'
@@ -406,97 +405,6 @@ async function heicBlobToJpegBlob(file) {
   }
 }
 
-// 将 File 加载为 HTMLImageElement，使用 decode() 保证手机端宽高可用。
-// 遇到 HEIC/HEIF 会先用 heic2any 转成 JPEG，再走正常解码。
-async function loadImageElement(file) {
-  const realFile = isHeicImage(file) ? await heicBlobToJpegBlob(file) : file
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(realFile)
-    const img = new Image()
-    img.decoding = 'async'
-    const done = (err) => {
-      URL.revokeObjectURL(url)
-      if (err) reject(err)
-      else resolve(img)
-    }
-    img.onload = () => {
-      // 优先使用 decode() 确保像素已解码，避免手机端 naturalWidth 读到 0
-      if (typeof img.decode === 'function') {
-        img.decode().then(() => done()).catch(() => done())
-      } else {
-        done()
-      }
-    }
-    img.onerror = () => done(new Error(`图片加载失败：${realFile.name}（格式可能不受支持）`))
-    img.src = url
-  })
-}
-
-// 将图片重绘到 canvas 并编码为 JPEG dataURL。
-// 用于规避 iOS Safari canvas 最大尺寸限制（约 4096px）导致 PDF 预览空白的问题，
-// 同时将 webp/gif 首帧等各种格式统一为 jsPDF 可靠支持的 JPEG。
-function imageToJpegDataUrl(img, maxEdge = 3000, quality = 0.9) {
-  const srcW = img.naturalWidth || img.width
-  const srcH = img.naturalHeight || img.height
-  if (!srcW || !srcH) {
-    throw new Error('图片尺寸读取失败，可能格式不受支持')
-  }
-  let targetW = srcW
-  let targetH = srcH
-  if (Math.max(srcW, srcH) > maxEdge) {
-    const scale = maxEdge / Math.max(srcW, srcH)
-    targetW = Math.max(1, Math.round(srcW * scale))
-    targetH = Math.max(1, Math.round(srcH * scale))
-  }
-  const canvas = document.createElement('canvas')
-  canvas.width = targetW
-  canvas.height = targetH
-  const ctx = canvas.getContext('2d')
-  if (!ctx) throw new Error('当前浏览器不支持 Canvas 绘制')
-  // 填充白底，避免透明 PNG 在 JPEG 中变黑
-  ctx.fillStyle = '#FFFFFF'
-  ctx.fillRect(0, 0, targetW, targetH)
-  ctx.drawImage(img, 0, 0, targetW, targetH)
-  const dataUrl = canvas.toDataURL('image/jpeg', quality)
-  if (!dataUrl || dataUrl === 'data:,') {
-    throw new Error('图片编码失败（分辨率可能超过浏览器限制）')
-  }
-  return { dataUrl, width: targetW, height: targetH }
-}
-
-async function imagesToPdfBlob(files, orient, pSize) {
-  const fileList = Array.isArray(files) ? files : [files]
-  const dims = paperDimensionsMap[pSize] || { width: 210, height: 297 }
-  const isLandscape = orient === 'landscape'
-  const doc = new jsPDF({
-    orientation: isLandscape ? 'l' : 'p',
-    unit: 'mm',
-    format: [dims.width, dims.height]
-  })
-  const pageWidth = doc.internal.pageSize.getWidth()
-  const pageHeight = doc.internal.pageSize.getHeight()
-  const margin = 10
-  const maxW = pageWidth - margin * 2
-  const maxH = pageHeight - margin * 2
-
-  for (let i = 0; i < fileList.length; i++) {
-    if (i > 0) doc.addPage([dims.width, dims.height], isLandscape ? 'l' : 'p')
-    const file = fileList[i]
-    const img = await loadImageElement(file)
-    const { dataUrl } = imageToJpegDataUrl(img)
-    const naturalW = img.naturalWidth || img.width
-    const naturalH = img.naturalHeight || img.height
-    const imgRatio = naturalW / naturalH
-    let drawW, drawH
-    if (imgRatio > maxW / maxH) { drawW = maxW; drawH = maxW / imgRatio }
-    else { drawH = maxH; drawW = maxH * imgRatio }
-    const x = margin + (maxW - drawW) / 2
-    const y = margin + (maxH - drawH) / 2
-    doc.addImage(dataUrl, 'JPEG', x, y, drawW, drawH)
-  }
-  return doc.output('blob')
-}
-
 function processMultipleImages(files) {
   clearFile()
   const arr = Array.from(files)
@@ -574,32 +482,42 @@ function removeImage(idx) {
   }
 }
 
-function textToPdfBlob(text, orient, pSize) {
-  const dims = paperDimensionsMap[pSize] || { width: 210, height: 297 }
-  const isLandscape = orient === 'landscape'
-  const doc = new jsPDF({
-    orientation: isLandscape ? 'l' : 'p',
-    unit: 'mm',
-    format: [dims.width, dims.height]
-  })
-  const pageWidth = doc.internal.pageSize.getWidth()
-  const margin = 15
-  const maxWidth = pageWidth - margin * 2
-  const lines = doc.splitTextToSize(text || '', maxWidth)
-  doc.text(lines, margin, margin)
-  return doc.output('blob')
+// 通过后端 /api/convert 将一或多张图片合成为单个 PDF。
+// - 单图时传 `file` 字段；多图时传多个 `files` 字段，由后端 convertImagesMultiToPDF 合并。
+// - HEIC 已由 processFile / processMultipleImages 提前转换为 JPEG，这里无需特殊处理。
+async function convertImagesToPdfViaServer(files, orient, pSize, name) {
+  const list = Array.isArray(files) ? files : [files]
+  const fd = new FormData()
+  if (list.length === 1) {
+    fd.append('file', list[0], list[0].name)
+  } else {
+    for (const f of list) fd.append('files', f, f.name)
+    if (name) fd.append('name', name)
+  }
+  if (orient) fd.append('orientation', orient)
+  if (pSize) fd.append('paper_size', pSize)
+  const resp = await apiFetch('/api/convert', { method: 'POST', body: fd }, () => emit('logout'))
+  if (!resp.ok) throw new Error('服务端转换失败：' + await readError(resp))
+  return resp.blob()
 }
 
+// 通过后端 /api/convert 将文本文件转成 PDF（使用后端内嵌中文字体，避免 jsPDF 中文乱码）。
+async function convertTextViaServer(file, orient, pSize) {
+  const fd = new FormData()
+  fd.append('file', file, file.name)
+  if (orient) fd.append('orientation', orient)
+  if (pSize) fd.append('paper_size', pSize)
+  const resp = await apiFetch('/api/convert', { method: 'POST', body: fd }, () => emit('logout'))
+  if (!resp.ok) throw new Error('服务端转换失败：' + await readError(resp))
+  return resp.blob()
+}
+
+// 通过后端 /api/convert 将 Office / OFD 文件转成 PDF。
 async function convertOfficeToPdf(file) {
   const fd = new FormData()
   fd.append('file', file, file.name)
-  const resp = await fetch('/api/convert', {
-    method: 'POST',
-    body: fd,
-    credentials: 'include',
-    headers: { 'X-CSRF-Token': getCSRF() }
-  })
-  if (!resp.ok) throw new Error('服务端转换失败：' + await resp.text())
+  const resp = await apiFetch('/api/convert', { method: 'POST', body: fd }, () => emit('logout'))
+  if (!resp.ok) throw new Error('服务端转换失败：' + await readError(resp))
   return resp.blob()
 }
 
@@ -610,14 +528,15 @@ async function convertToPdf() {
     const f = selectedFile.value
     let blob
     if (isMultiImage.value) {
-      blob = await imagesToPdfBlob(selectedImages.value, orientation.value, paperSize.value)
+      blob = await convertImagesToPdfViaServer(
+        selectedImages.value, orientation.value, paperSize.value, downloadName.value || '合并图片.pdf'
+      )
     } else if (isOfficeFile(f) || isOFDFile(f)) {
       blob = await convertOfficeToPdf(f)
     } else if (f.type.startsWith('image/')) {
-      blob = await imagesToPdfBlob(f, orientation.value, paperSize.value)
+      blob = await convertImagesToPdfViaServer([f], orientation.value, paperSize.value)
     } else {
-      const text = await f.text()
-      blob = textToPdfBlob(text, orientation.value, paperSize.value)
+      blob = await convertTextViaServer(f, orientation.value, paperSize.value)
     }
     pdfBlob.value = blob
     clearPreviewUrl()
@@ -663,16 +582,12 @@ async function uploadAndPrint() {
 
   printing.value = true
   try {
-    const resp = await fetch('/api/print', {
+    const resp = await apiFetch('/api/print', {
       method: 'POST',
-      body: form,
-      credentials: 'include',
-      headers: { 'X-CSRF-Token': getCSRF() }
-    })
+      body: form
+    }, () => emit('logout'))
     if (!resp.ok) {
-      const data = await resp.json().catch(() => ({}))
-      if (resp.status === 401) emit('logout')
-      throw new Error(data.error || resp.statusText)
+      throw new Error(await readError(resp))
     }
     const j = await resp.json()
     toast.add({
@@ -694,7 +609,7 @@ async function uploadAndPrint() {
 async function loadPrintRecords(silent = false) {
   if (!silent) loadingRecords.value = true
   try {
-    const resp = await fetch('/api/print-records', { credentials: 'include' })
+    const resp = await apiFetch('/api/print-records', {}, () => emit('logout'))
     if (resp.ok) {
       const data = await resp.json()
       printRecords.value = (data || []).map(r => ({
@@ -702,8 +617,6 @@ async function loadPrintRecords(silent = false) {
         pages: r.pages, status: r.status, isColor: r.isColor,
         isDuplex: r.isDuplex, jobId: r.jobId, createdAt: r.createdAt
       }))
-    } else if (resp.status === 401) {
-      emit('logout')
     }
   } catch (e) {
     console.error('加载打印记录失败', e)
@@ -718,14 +631,15 @@ async function loadPrinterInfo(silent = false) {
   if (!silent) loadingPrinterInfo.value = true
   printerInfoError.value = ''
   try {
-    const resp = await fetch(`/api/printer-info?uri=${encodeURIComponent(printer.value)}`, { credentials: 'include' })
+    const resp = await apiFetch(
+      `/api/printer-info?uri=${encodeURIComponent(printer.value)}`,
+      {},
+      () => emit('logout')
+    )
     if (resp.ok) {
       printerInfo.value = await resp.json()
-    } else if (resp.status === 401) {
-      emit('logout')
-    } else {
-      const d = await resp.json().catch(() => ({}))
-      printerInfoError.value = d.error || '查询失败'
+    } else if (resp.status !== 401) {
+      printerInfoError.value = await readError(resp)
     }
   } catch (_) {
     printerInfoError.value = '无法连接到打印机'
@@ -753,7 +667,7 @@ let printerInfoTimer = null
 // ─── 生命周期 ─────────────────────────────────────────────
 onMounted(async () => {
   try {
-    const resp = await fetch('/api/printers', { credentials: 'include' })
+    const resp = await apiFetch('/api/printers', {}, () => emit('logout'))
     if (resp.ok) {
       printers.value = await resp.json()
       const last = localStorage.getItem('last_printer')
@@ -763,8 +677,6 @@ onMounted(async () => {
         printer.value = printers.value[0].uri
       }
       if (printer.value) loadPrinterInfo()
-    } else if (resp.status === 401) {
-      emit('logout')
     }
   } catch (e) {
     toast.add({ title: '加载打印机失败', description: e.message, color: 'error' })
