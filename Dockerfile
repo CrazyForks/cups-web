@@ -1,3 +1,10 @@
+# syntax=docker/dockerfile:1
+#
+# 顶部的 `# syntax=docker/dockerfile:1` 声明要求 BuildKit 前端——`BUILDPLATFORM`
+# 这类自动变量由 BuildKit 注入，若缺失声明，部分旧 buildx 环境会把它当成
+# 未设置，导致 `--platform=$BUILDPLATFORM` 退化成 `--platform=`（默认 target），
+# 跨架构构建时 java-builder 会重新落回 QEMU 模拟，前功尽弃。
+
 # ---- Frontend build ----
 # 使用 node:20-slim 替代 oven/bun：Bun 官方不支持 32-bit ARM（#5060 Closed as not planned），
 # 会导致 linux/arm/v7 构建直接找不到 manifest。node:20-slim 官方镜像覆盖 amd64/arm32v7/arm64v8，
@@ -11,22 +18,32 @@ COPY frontend ./
 RUN npm run build
 
 # ---- Java OFD converter build ----
-# 选型：debian:bookworm-slim + apt 装 openjdk-17-jdk-headless + curl/ca-certificates，
-# Maven 用 Apache 官方 3.9.x 二进制 tarball，不用 Debian 的 maven 包。
 #
-# 为什么不用 maven:3.9-eclipse-temurin-17：Eclipse Temurin 17 在 Linux ARM 32-bit 上
-# Not Supported（Adoptium 官方平台矩阵，JDK 17/21/25 均无 armhf），Maven 官方镜像同样
-# 没有 armhf manifest。debian:bookworm-slim 在三架构都有 openjdk-17-jdk-headless，
-# ofd-converter 的 maven.compiler.source=1.8，JDK 17 完全能驱动编译与运行。
+# 关键点：`FROM --platform=$BUILDPLATFORM ...` 把本阶段锁在 **host 本地架构**（CI 上是 amd64），
+# 不跟随 buildx 的 TARGETPLATFORM 走进 QEMU armhf 模拟。这么做的核心理由：
 #
-# 为什么不用 Debian 的 apt install maven：QEMU 用户态模拟 armhf 下，Debian 的
-# maven 包装完无法启动，会抛 java.lang.ClassNotFoundException: org.apache.maven.cli.MavenCli
-# —— 这是上游已知坑（GitHub carlossg/docker-maven#213）。根因是 Debian maven 包依赖
-# dpkg triggers + update-alternatives 把 maven-core.jar 等软链进 plexus-classworlds
-# 启动器的 classpath，QEMU 模拟下这些 triggers 有时会静默跳过或执行不完整。而 Apache
-# 官方 tarball 是纯 Java 且 classpath 完全自包含（lib/ 下所有 jar 都直接可用），
-# 同一个 tar.gz 跨架构通吃，不依赖任何 OS 打包细节。
-FROM debian:bookworm-slim AS java-builder
+#   QEMU 用户态模拟 armhf 下，OpenJDK 17 不稳定。Maven 无论是用 Debian 的 `apt install maven`
+#   还是 Apache 官方 Maven 3.9.x 二进制 tarball，启动时都会随机抛
+#   `java.lang.ClassNotFoundException: org.apache.maven.cli.MavenCli`（堆栈完全一致，只差
+#   classworlds 版本行号），这说明问题在 JVM 层——具体是 QEMU 模拟下的 ClassLoader /
+#   JIT 稳定性问题，而非 Maven 安装方式。侧面佐证：Adoptium Temurin JDK 17/21/25 对 Linux
+#   ARM 32-bit Hard-Float **官方不支持**（仅 JDK 8/11 有 armhf 二进制），说明 ARM 32-bit 上的
+#   现代 JVM 本来就是薄弱环节，在 QEMU 下更是雪上加霜。
+#
+# 由于 ofd-converter 是纯 Java 项目（maven.compiler.source=1.8 → target JVM bytecode），
+# 产物 `.jar` 跨架构通吃，让 java-builder 固定跑在 amd64 上构建一次、各架构的 runtime
+# 统一 `COPY --from=java-builder` 这份纯字节码 jar，是 Docker 官方推荐的多架构 Java
+# 最佳实践，也是 `BUILDPLATFORM` 这个自动变量最典型的用法。
+#
+# 其他保留说明：
+# - 基础镜像仍用 debian:bookworm-slim（和 runtime 阶段统一，减少下载层）；
+# - Maven 仍用 Apache 官方 tarball（`apt install maven` 依赖 dpkg triggers 更新
+#   update-alternatives 软链，虽然 host amd64 不会触发 QEMU 坑，但 tarball 方式更自包含，
+#   跨 base 镜像升级无副作用）；
+# - 即便某天 GitHub Actions 的 runner 换成 arm64/linux，`BUILDPLATFORM` 也会自动跟随，
+#   那时 amd64 的 runtime 反而要 QEMU 模拟 java-builder——但 amd64 上的 JVM 远比 armhf 稳，
+#   在实践中是可接受的。真正要彻底脱离 QEMU，只能靠 GH Actions 的 multi-runner 矩阵拆分。
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS java-builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MAVEN_VERSION=3.9.9
 ENV MAVEN_HOME=/opt/maven
