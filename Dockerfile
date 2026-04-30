@@ -72,11 +72,23 @@ COPY . .
 COPY --from=frontend-build /src/frontend/dist ./frontend/dist
 
 # Build the Go binary (frontend must be built before this step in CI/local)
-# 只在 VERSION 非空时追加 `-X main.Version=...`，避免传入空值导致 ldflags 拼接出
-# `-X main.Version=` 这种含空值的不合法 flag（部分 Go 版本会把空值写成字面空串）。
+#
+# ldflags 注入版本号的写法说明：
+#
+# 以前尝试过条件写法 `$([ -n "$VERSION" ] && echo "-X main.Version=$VERSION")`
+# 在 Docker RUN 的 shell form 下会挂——因为 Dockerfile 会先把 $VERSION 展开，
+# 导致 shell 实际看到的是四层嵌套双引号的 `-ldflags="-s -w $(... "master" ...
+# "-X main.Version=master")"`，中间那对 `"master"` 把外层 -ldflags="..."
+# 提前闭合，于是 `-X main.Version=master` 被切开，链接器只收到 `-X main.Version`，
+# 报 `flag provided but not defined: -X main.Version`。
+#
+# 修复思路：Go 对 `-X main.Version=`（空串）是合法接受的（等价于 var Version = ""，
+# 与默认值 "dev" 在显示上有区别但不会报错），所以无需条件判断，直接无条件
+# 拼 `-X main.Version=$VERSION`，让 Docker ARG 展开去把 $VERSION 变成空串或
+# 实际值，shell 里只剩一对引号，彻底避开嵌套转义。
 RUN CGO_ENABLED=0 GOOS=linux \
     go build \
-      -ldflags="-s -w $([ -n \"$VERSION\" ] && echo \"-X main.Version=$VERSION\")" \
+      -ldflags="-s -w -X main.Version=$VERSION" \
       -o /out/cups-web ./cmd/server
 
 FROM debian:bookworm-slim AS runtime
