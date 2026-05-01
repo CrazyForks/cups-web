@@ -64,8 +64,11 @@ cups-web/
 │   ├── estimate_handler.go        # /api/estimate（预估页数）
 │   ├── file_utils.go              # 文件保存、文件类型识别、页数统计
 │   ├── pdf_utils.go               # 图片 / 文本 → PDF 的渲染
+│   ├── pdf_normalize.go           # PDF 标准化管线（gs → LibreOffice → passthrough）
+│   ├── pdf_normalize_test.go      # PDF 标准化相关的本地测试用例
 │   ├── fonts.go                   # 中文字体加载（内嵌 assets/fonts）
 │   ├── maintenance.go             # 后台维护任务（按保留天数清理）
+│   ├── version.go                 # 构建期注入的版本号（-ldflags -X main.Version）
 │   └── assets/fonts/              # 打包进二进制的字体资源
 ├── internal/
 │   ├── auth/session.go            # securecookie 会话 + CSRF cookie
