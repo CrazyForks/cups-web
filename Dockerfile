@@ -219,6 +219,17 @@ RUN test -s /etc/ghostscript/cidfmap.local \
   && echo "[dockerfile] cidfmap.local entries: $entries (expect 8)" \
   && test "$entries" = "8"
 
+# 将 cidfmap.local 复制到 Ghostscript 的标准资源路径 Resource/Init/，让 gs 启动时自动加载。
+# gs 10.x 的 `-c "(cidfmap.local) .runlibfile"` 机制已不可用（.runlibfile 操作符不存在，
+# 且 `-c ... -f` 会吞掉后续 `-sOutputFile=` 参数），改用 gs 自动加载机制。
+# 使用 find 查找 Resource/Init 目录，兼容不同 gs 版本的安装路径。
+RUN find /usr/share/ghostscript -name "Resource" -type d 2>/dev/null | while read d; do \
+        if [ -d "$d/Init" ]; then \
+            cp /etc/ghostscript/cidfmap.local "$d/Init/cidfmap.local" && \
+            echo "[dockerfile] cidfmap.local -> $d/Init/cidfmap.local"; \
+        fi; \
+    done
+
 # Create a non-root user for running the service
 RUN groupadd -r nonroot && useradd -r -g nonroot nonroot
 

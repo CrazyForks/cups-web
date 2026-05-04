@@ -24,10 +24,13 @@ var errBinaryNotInstalled = errors.New("not installed")
 
 // runLibreOfficeConvert 调用 libreoffice --headless --convert-to <filter> 做通用文档转换，
 // 返回生成的 PDF 绝对路径、清理函数与错误。filter 为空时默认使用 "pdf"。
+// infilter 不为空时，会在命令行中追加 --infilter=<infilter> 参数，用于指定输入格式
+// （例如 PDF→PDF 场景传入 "writer_pdf_import" 让 LibreOffice 用 Writer 的 PDF 导入器
+// 解析原 PDF，而不是走 Draw 默认路径——后者对中文字体映射更差）。
 //
 // libreoffice 不在 PATH 中时，返回的错误可被 errors.Is(err, errBinaryNotInstalled) 识别，
 // 供 PDF 标准化管线做"友好跳过"日志处理；Office 文档转换场景则正常向上报错即可。
-func runLibreOfficeConvert(ctx context.Context, inputPath string, filter string) (string, func(), error) {
+func runLibreOfficeConvert(ctx context.Context, inputPath string, filter string, infilter string) (string, func(), error) {
 	if _, err := exec.LookPath("libreoffice"); err != nil {
 		return "", nil, fmt.Errorf("libreoffice %w", errBinaryNotInstalled)
 	}
@@ -42,7 +45,12 @@ func runLibreOfficeConvert(ctx context.Context, inputPath string, filter string)
 	if convertTo == "" {
 		convertTo = "pdf"
 	}
-	cmd := exec.CommandContext(ctx, "libreoffice", "--headless", "--convert-to", convertTo, "--outdir", tmpDir, inputPath)
+	args := []string{"--headless", "--convert-to", convertTo}
+	if infilter != "" {
+		args = append(args, "--infilter="+infilter)
+	}
+	args = append(args, "--outdir", tmpDir, inputPath)
+	cmd := exec.CommandContext(ctx, "libreoffice", args...)
 	cmd.Env = append(os.Environ(), "LANG=zh_CN.UTF-8", "LC_ALL=zh_CN.UTF-8")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()
@@ -66,14 +74,15 @@ func runLibreOfficeConvert(ctx context.Context, inputPath string, filter string)
 
 // convertOfficeToPDF 将 Office 文档（.doc/.docx/.xls/.xlsx/.ppt/.pptx）转成 PDF。
 func convertOfficeToPDF(ctx context.Context, inputPath string) (string, func(), error) {
-	return runLibreOfficeConvert(ctx, inputPath, "pdf")
+	return runLibreOfficeConvert(ctx, inputPath, "pdf", "")
 }
 
 // convertPDFViaLibreOffice 通过 LibreOffice 重新导出 PDF，用作 Ghostscript 不可用时的兜底。
-// LibreOffice 对部分 Acrobat 高版本 PDF 的解析好于原生 rsc.io/pdf，但兼容性仍不如 Ghostscript，
-// 因此仅在 gs 路径失败后调用。
+// 使用 --infilter=writer_pdf_import 让 LibreOffice 通过 Writer 的 PDF 导入器解析原 PDF，
+// 而不是走 Draw 默认路径——Writer 导入器对中文字体的映射更准确，能正确处理 GBK 编码
+// CID 字体的 PDF，避免 Ghostscript 10.x pdfwrite 破坏文本编码导致的中文乱码问题。
 func convertPDFViaLibreOffice(ctx context.Context, inputPath string) (string, func(), error) {
-	return runLibreOfficeConvert(ctx, inputPath, "pdf")
+	return runLibreOfficeConvert(ctx, inputPath, "pdf", "writer_pdf_import")
 }
 
 func convertOFDToPDF(ctx context.Context, inputPath string) (string, func(), error) {

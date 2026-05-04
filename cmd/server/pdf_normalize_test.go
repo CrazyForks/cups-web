@@ -308,7 +308,9 @@ func lookPathSafe(name string) (string, error) {
 
 // TestCidfmapPreambleArgs 覆盖 cidfmapPreambleArgs 的两个分支：
 //  1. cidfmap 文件不存在（macOS 本地开发机）→ 返回 nil，gs 命令行退化为默认行为
-//  2. cidfmap 文件存在（Docker runtime）→ 返回 -I + -c "(xxx) .runlibfile" + -f 三段参数
+//  2. cidfmap 文件存在（Docker runtime）→ 返回仅含 -I<搜索路径> 的单元素切片
+//     （gs 10.x 不支持 .runlibfile，cidfmap.local 已被 Dockerfile 复制到 gs 的
+//     Resource/Init 目录实现自动加载，此处 -I 仅作兜底）
 //
 // 用临时目录 + 临时文件替换全局变量 cidfmapSystemPath，跑完自动还原。
 func TestCidfmapPreambleArgs(t *testing.T) {
@@ -321,7 +323,7 @@ func TestCidfmapPreambleArgs(t *testing.T) {
 		t.Errorf("expected nil when cidfmap missing, got: %v", args)
 	}
 
-	// 分支 2：在临时目录里建一个假的 cidfmap.local，preamble 必须带完整三段参数
+	// 分支 2：在临时目录里建一个假的 cidfmap.local，preamble 必须只含 -I 参数
 	tmpDir := t.TempDir()
 	fakeCidfmap := filepath.Join(tmpDir, "cidfmap.local")
 	if err := os.WriteFile(fakeCidfmap, []byte("%! fake cidfmap\n"), 0644); err != nil {
@@ -330,24 +332,12 @@ func TestCidfmapPreambleArgs(t *testing.T) {
 	cidfmapSystemPath = fakeCidfmap
 
 	args := cidfmapPreambleArgs()
-	if len(args) != 4 {
-		t.Fatalf("expected 4 args, got %d: %v", len(args), args)
+	if len(args) != 1 {
+		t.Fatalf("expected 1 arg, got %d: %v", len(args), args)
 	}
 	// -I<搜索路径>：必须指向 cidfmap 所在目录
 	wantISwitch := "-I" + tmpDir
 	if args[0] != wantISwitch {
 		t.Errorf("args[0] = %q, want %q", args[0], wantISwitch)
-	}
-	// -c "(cidfmap.local) .runlibfile"：把 cidfmap 文件名放进 PostScript 字符串字面量
-	if args[1] != "-c" {
-		t.Errorf("args[1] = %q, want -c", args[1])
-	}
-	wantRunlib := "(cidfmap.local) .runlibfile"
-	if args[2] != wantRunlib {
-		t.Errorf("args[2] = %q, want %q", args[2], wantRunlib)
-	}
-	// -f：结束 -c 的 PostScript 代码段，让后续位置参数被当成输入文件
-	if args[3] != "-f" {
-		t.Errorf("args[3] = %q, want -f", args[3])
 	}
 }
