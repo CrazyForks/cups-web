@@ -107,23 +107,22 @@ func summarizeToolError(tool string, err error) string {
 // 让 gs 按默认行为运行（macOS brew 装的 gs 自带 DroidSansFallback，开发环境
 // 不会踩到 GBK 空壳字体乱码的问题）。
 //
-// gs 10.x 不再支持 `.runlibfile` 操作符，且 `-c ... -f` 组合会吞掉后续的
-// `-sOutputFile=` 参数导致报错 "Device 'pdfwrite' requires an output file"。
-// 因此改为只通过 `-I` 添加搜索路径：cidfmap.local 在 Dockerfile 中已被复制到
-// gs 的 Resource/Init 目录（gs 启动时会自动加载该目录下的 cidfmap* 文件），
-// 此处 `-I` 仅作为兜底（macOS 等本地开发环境）。
-//
-// 参考：/usr/share/ghostscript/*/doc/Use.htm#CIDFontSubstitution
+// cidfmapSystemPath 指向 Docker 镜像中写入的 cidfmap.local 文件。
+// cidfmapPreambleArgs 在每次 gs 调用时显式用
+// `-I/etc/ghostscript -c "(cidfmap.local) .runlibfile" -f` 加载，
+// 不依赖 Debian gs 的自动合并约定（不同版本行为差异大）；
+// cidfmap 文件不存在时 preamble 为空，兼容 macOS 本地开发。
 var cidfmapSystemPath = "/etc/ghostscript/cidfmap.local"
 
 func cidfmapPreambleArgs() []string {
 	if _, err := os.Stat(cidfmapSystemPath); err != nil {
 		return nil
 	}
-	// gs 10.x 不支持 .runlibfile，改为只添加搜索路径。
-	// cidfmap.local 在 Dockerfile 中已被复制到 gs 的 Resource/Init 目录，
-	// gs 启动时会自动加载。此处 -I 仅作为兜底（macOS 等本地开发环境）。
-	return []string{"-I" + filepath.Dir(cidfmapSystemPath)}
+	return []string{
+		"-I" + filepath.Dir(cidfmapSystemPath),
+		"-c", "(" + filepath.Base(cidfmapSystemPath) + ") .runlibfile",
+		"-f",
+	}
 }
 
 // runGhostscriptNormalize 调用 `gs` 把 PDF 重写为兼容性更好的 1.4 版本并嵌入所有字体。
