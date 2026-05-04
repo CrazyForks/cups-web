@@ -47,6 +47,29 @@ RUN apt-get update && \
       avahi-daemon && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Epson ESC/P-R 2 驱动：Debian 官方仓库不提供此包，从 Epson 官方源码编译安装。
+# 支持 ET-18100, L8050, L8160, WF-7840 等新款 Epson 喷墨打印机的完整功能（含无边距打印）。
+# 版本更新时需同时修改 ESCPR2_VERSION 和 ESCPR2_UUID（从 Epson 下载中心获取新版本的 URL）。
+ARG ESCPR2_VERSION=1.2.39
+ARG ESCPR2_UUID=12bbe234-329d-4b3c-922c-e497f25f5e32
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential libcups2-dev libcupsimage2-dev && \
+    mkdir -p /tmp/escpr2-build && \
+    # Epson 下载中心会拦截非浏览器 UA，需伪装为 Firefox 才能下载成功
+    wget --user-agent=Firefox -q -O /tmp/escpr2-build/escpr2.tar.gz \
+      "https://download-center.epson.com/f/module/${ESCPR2_UUID}/epson-inkjet-printer-escpr2-${ESCPR2_VERSION}-1.tar.gz" && \
+    cd /tmp/escpr2-build && \
+    mkdir src && cd src && \
+    tar xzf ../escpr2.tar.gz --strip-components=1 && \
+    ./configure --prefix=/usr --disable-static && \
+    make -j"$(nproc)" && \
+    make install && \
+    cd / && rm -rf /tmp/escpr2-build && \
+    apt-get purge -y build-essential libcups2-dev libcupsimage2-dev && \
+    apt-get autoremove -y && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # printer-driver-gutenprint 在 trixie armhf 上没有 binary 包（gutenprint 的
 # 链接依赖 libgutenprint9 未完成 t64 迁移），仅在 amd64/arm64 上安装。
 # armhf 用户仍可通过 printer-driver-all 推荐的其他驱动覆盖大部分打印机。
