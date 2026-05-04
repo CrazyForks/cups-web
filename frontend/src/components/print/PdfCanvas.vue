@@ -122,8 +122,10 @@ async function renderPdf() {
 
     // 关键参数说明：
     // - cMapUrl / cMapPacked：支持 UniGB-UCS2-H 等中文外部 CMap，修复 CJK 预览空白
-    // - standardFontDataUrl + useSystemFonts：预览未嵌入字体的 PDF 时用系统兜底字体
+    // - standardFontDataUrl：提供标准 14 字体数据（Helvetica/Courier/Times 等）
     // - disableFontFace=false：允许用 @font-face 注入字体（默认就是 false，显式保留以防升级回归）
+    // - useSystemFonts=false：优先使用 PDF 中嵌入的字体而非系统字体，
+    //   配合后端 normalizePDF（gs pdfwrite 嵌入 TrueType 子集），确保预览与打印字形一致
     // - isEvalSupported=false：CSP/严格 Worker 环境下避免 eval 被拦截
     const doc = await pdfjsLib.getDocument({
       url: props.src,
@@ -131,7 +133,7 @@ async function renderPdf() {
       cMapPacked: true,
       standardFontDataUrl: '/pdfjs/standard_fonts/',
       disableFontFace: false,
-      useSystemFonts: true,
+      useSystemFonts: false,
       isEvalSupported: false
     }).promise
 

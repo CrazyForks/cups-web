@@ -25,11 +25,11 @@ gs 无法正确解析字形数据，会导致输出 PDF 中文字变成乱码方
 | GBK 名称 | 映射字体 |
 |-----------|----------|
 | 宋体 (CB CE CC E5) Regular | simsun.ttf |
-| 宋体 Bold | simhei.ttf |
+| 宋体 Bold | simsun.ttf |
 | 黑体 (BA DA CC E5) Regular/Bold | simhei.ttf |
 | 楷体 (BF AC CC E5) Regular/Bold | simkai.ttf |
 | 仿宋 (B7 C2 CB CE) Regular | simfang.ttf |
-| 仿宋 Bold | simhei.ttf |
+| 仿宋 Bold | simfang.ttf |
 
 ## 使用
 
