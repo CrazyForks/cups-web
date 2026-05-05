@@ -153,13 +153,13 @@ RUN mkdir -p /tmp/cups-build && cd /tmp/cups-build && \
 # ESC/P-R 2 的 configure 会直接通过 cups-config 找到新编译出的 libcups，
 # 避免 apt 版 -dev 包回踩覆盖源码装好的 /usr/include/cups/*.h。
 #
-# ⚠️ Best-effort 策略：
+# ⚠️ Fail-fast 策略：
 # Epson 下载中心（download-center.epson.com）挂在 Akamai CDN 后面，会对请求做
 # UA/Header/TLS 指纹等多维度风控，出现 HTTP 403 Forbidden 的概率不低——Arch AUR
 # 的 `epson-inkjet-printer-escpr2` PKGBUILD 评论区也一直有人反馈"同一链路换个工具/换个
 # UA 就能下载成功"。所以这里**依次尝试多种下载策略**（wget-Chrome → wget-Firefox
-# → curl-Firefox-qgb），任一成功即进入编译；全部失败再降级为 WARNING，让整体 build
-# 继续走完（非 ESCPR2 机型不受影响，老 Epson 机型 Debian printer-driver-escpr 已覆盖）。
+# → curl-Firefox-qgb），任一成功即进入编译；**全部失败则整个 docker build 直接失败**，
+# 避免构建"静默降级"导致发布镜像里缺少 ESCPR2 驱动却无人察觉。
 # 同时 UUID 会被 Epson 定期轮换，若新版本发布后下载仍稳定 403，去
 # https://download-center.epson.com 下载页按 F12 抓新 UUID 更新 ESCPR2_UUID/
 # ESCPR2_VERSION 即可。
@@ -169,38 +169,40 @@ ARG ESCPR2_UUID=12bbe234-329d-4b3c-922c-e497f25f5e32
 # 有时长 UA 比短 UA 更容易被拦，反之亦然，两个都试）。
 ARG ESCPR2_UA_CHROME="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ARG ESCPR2_UA_FIREFOX="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
-# 用 subshell 隔离 set -e 语境：子 shell 内任何一步失败就整个失败，
-# 外层用 `|| echo WARNING` 捕获并降级为警告，不让 docker build 整体 abort。
-RUN ( set -e; \
-      mkdir -p /tmp/escpr2-build && cd /tmp/escpr2-build && \
-      ESCPR2_URL="https://download-center.epson.com/f/module/${ESCPR2_UUID}/epson-inkjet-printer-escpr2-${ESCPR2_VERSION}-1.tar.gz" && \
-      echo "[escpr2] downloading ${ESCPR2_URL}" && \
-      # 依次尝试三种下载策略，任一成功立即跳出；全部失败才让 subshell 整体失败 \
-      ( \
-        echo "[escpr2] attempt 1: wget + Chrome UA" && \
-        wget --tries=3 --timeout=60 --retry-connrefused \
-             --user-agent="${ESCPR2_UA_CHROME}" \
-             -O escpr2.tar.gz "${ESCPR2_URL}" \
-      ) || ( \
-        echo "[escpr2] attempt 2: wget + Firefox UA" && \
-        wget --tries=3 --timeout=60 --retry-connrefused \
-             --user-agent="${ESCPR2_UA_FIREFOX}" \
-             -O escpr2.tar.gz "${ESCPR2_URL}" \
-      ) || ( \
-        # 与 AUR PKGBUILD 对齐的 curl 调用：-qgb "" 忽略 ~/.curlrc 且用空 cookie jar，\
-        # -fL 在遇到 4xx/重定向时表现更贴近浏览器；不少反馈 curl 比 wget 更能过 Akamai。\
-        echo "[escpr2] attempt 3: curl + Firefox UA" && \
-        curl --user-agent "Firefox" -qgb "" -fL --retry 3 --retry-delay 3 \
-             -o escpr2.tar.gz "${ESCPR2_URL}" \
-      ) && \
-      mkdir src && cd src && \
-      tar xzf ../escpr2.tar.gz --strip-components=1 && \
-      ./configure --prefix=/usr --disable-static && \
-      make -j"$(nproc)" && \
-      make install && \
-      echo "[escpr2] installed version ${ESCPR2_VERSION}" \
-    ) || echo "[escpr2] WARNING: ESC/P-R 2 driver build skipped (all download attempts failed with HTTP 403 or compile error). Non-ESCPR2 Epson printers are unaffected; Debian printer-driver-escpr still covers most older models. If newer ET/L/WF models are required, either retry the build (Akamai CDN blocks are often transient) or update ESCPR2_UUID/ESCPR2_VERSION per https://download-center.epson.com."; \
-    rm -rf /tmp/escpr2-build
+# 用 `set -eo pipefail` 保证任何一步失败都让整个 RUN 指令以非零退出码结束，
+# 触发 docker build 立即 abort，避免构建产出缺少 ESCPR2 驱动的"看似成功"镜像。
+RUN set -eo pipefail; \
+    mkdir -p /tmp/escpr2-build && cd /tmp/escpr2-build && \
+    ESCPR2_URL="https://download-center.epson.com/f/module/${ESCPR2_UUID}/epson-inkjet-printer-escpr2-${ESCPR2_VERSION}-1.tar.gz" && \
+    echo "[escpr2] downloading ${ESCPR2_URL}" && \
+    # 依次尝试三种下载策略，任一成功立即跳出；全部失败则整个 RUN 失败（docker build abort） \
+    ( \
+      echo "[escpr2] attempt 1: wget + Chrome UA" && \
+      wget --tries=3 --timeout=60 --retry-connrefused \
+           --user-agent="${ESCPR2_UA_CHROME}" \
+           -O escpr2.tar.gz "${ESCPR2_URL}" \
+    ) || ( \
+      echo "[escpr2] attempt 2: wget + Firefox UA" && \
+      wget --tries=3 --timeout=60 --retry-connrefused \
+           --user-agent="${ESCPR2_UA_FIREFOX}" \
+           -O escpr2.tar.gz "${ESCPR2_URL}" \
+    ) || ( \
+      # 与 AUR PKGBUILD 对齐的 curl 调用：-qgb "" 忽略 ~/.curlrc 且用空 cookie jar，\
+      # -fL 在遇到 4xx/重定向时表现更贴近浏览器；不少反馈 curl 比 wget 更能过 Akamai。\
+      echo "[escpr2] attempt 3: curl + Firefox UA" && \
+      curl --user-agent "Firefox" -qgb "" -fL --retry 3 --retry-delay 3 \
+           -o escpr2.tar.gz "${ESCPR2_URL}" \
+    ) || { \
+      echo "[escpr2] FATAL: all download attempts failed (HTTP 403 or network error). Retry the build (Akamai CDN blocks are often transient) or update ESCPR2_UUID/ESCPR2_VERSION per https://download-center.epson.com." >&2; \
+      exit 1; \
+    }; \
+    mkdir src && cd src && \
+    tar xzf ../escpr2.tar.gz --strip-components=1 && \
+    ./configure --prefix=/usr --disable-static && \
+    make -j"$(nproc)" && \
+    make install && \
+    echo "[escpr2] installed version ${ESCPR2_VERSION}" && \
+    cd / && rm -rf /tmp/escpr2-build
 
 # ────────────────────────────────────────────────────────────────────────────
 # 清理编译工具链：CUPS 与 ESC/P-R 2 都已编译安装完毕，构建依赖可以全部清理。
@@ -282,8 +284,9 @@ RUN if [ "${TARGETARCH}" != "arm" ]; then \
 #
 # ⚠️ 与 ESCPR2 同样的坑：download-center.epson.com.cn 的 UUID 会定期轮换，
 # URL 失效时 wget 退出码 8（HTTP 4xx）会让整个 docker build abort。
-# 这里包进 subshell + `|| echo WARNING` 做成 best-effort——下载 / dpkg 任一
-# 步失败只打告警不中断镜像构建，arm64/armhf 本来就跳过，不受影响。
+# 此处采用 **fail-fast**：下载 / dpkg 任一步失败则 docker build 立刻中断，
+# 避免发布镜像里缺少国行驱动却静默成功。arm64/armhf 本来就跳过整个 RUN 块，
+# 不受影响。
 # 升级方法：去 https://download-center.epson.com.cn 找对应机型按 F12 抓新
 # UUID，更新下面两个 ARG 即可。
 ARG EPSON_PROP_DRIVER_UUID=81976474-cb4d-4b75-a0d8-ebc9ebde70d0
@@ -292,22 +295,21 @@ ARG EPSON_PROP_UTILITY_UUID=b04dc5b0-cb78-4ce7-98c8-06731fb74062
 ARG EPSON_PROP_UTILITY_DEB=epson-printer-utility_1.2.2-1_amd64.deb
 ARG EPSON_PROP_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 RUN if [ "${TARGETARCH}" = "amd64" ]; then \
-      ( set -e; \
-        mkdir -p /tmp/epson_driver && cd /tmp/epson_driver && \
-        EPSON_DRV_URL="https://download-center.epson.com.cn/f/module/${EPSON_PROP_DRIVER_UUID}/${EPSON_PROP_DRIVER_DEB}" && \
-        EPSON_UTIL_URL="https://download-center.epson.com.cn/f/module/${EPSON_PROP_UTILITY_UUID}/${EPSON_PROP_UTILITY_DEB}" && \
-        echo "[epson-prop] downloading ${EPSON_DRV_URL}" && \
-        wget --tries=3 --timeout=60 --retry-connrefused \
-             --user-agent="${EPSON_PROP_UA}" \
-             -O "${EPSON_PROP_DRIVER_DEB}" "${EPSON_DRV_URL}" && \
-        echo "[epson-prop] downloading ${EPSON_UTIL_URL}" && \
-        wget --tries=3 --timeout=60 --retry-connrefused \
-             --user-agent="${EPSON_PROP_UA}" \
-             -O "${EPSON_PROP_UTILITY_DEB}" "${EPSON_UTIL_URL}" && \
-        ( dpkg -i ./*.deb || apt-get install -y -f --no-install-recommends ) && \
-        echo "[epson-prop] installed Epson CN proprietary driver + utility" \
-      ) || echo "[epson-prop] WARNING: Epson CN proprietary driver skipped (download or dpkg failed). L380/L455 国行机型可回落到 Debian printer-driver-escpr；如需恢复此驱动请在 https://download-center.epson.com.cn 查新 UUID 并更新 EPSON_PROP_DRIVER_UUID/EPSON_PROP_UTILITY_UUID 构建参数。"; \
-      rm -rf /tmp/epson_driver; \
+      set -eo pipefail; \
+      mkdir -p /tmp/epson_driver && cd /tmp/epson_driver && \
+      EPSON_DRV_URL="https://download-center.epson.com.cn/f/module/${EPSON_PROP_DRIVER_UUID}/${EPSON_PROP_DRIVER_DEB}" && \
+      EPSON_UTIL_URL="https://download-center.epson.com.cn/f/module/${EPSON_PROP_UTILITY_UUID}/${EPSON_PROP_UTILITY_DEB}" && \
+      echo "[epson-prop] downloading ${EPSON_DRV_URL}" && \
+      wget --tries=3 --timeout=60 --retry-connrefused \
+           --user-agent="${EPSON_PROP_UA}" \
+           -O "${EPSON_PROP_DRIVER_DEB}" "${EPSON_DRV_URL}" && \
+      echo "[epson-prop] downloading ${EPSON_UTIL_URL}" && \
+      wget --tries=3 --timeout=60 --retry-connrefused \
+           --user-agent="${EPSON_PROP_UA}" \
+           -O "${EPSON_PROP_UTILITY_DEB}" "${EPSON_UTIL_URL}" && \
+      ( dpkg -i ./*.deb || apt-get install -y -f --no-install-recommends ) && \
+      echo "[epson-prop] installed Epson CN proprietary driver + utility" && \
+      cd / && rm -rf /tmp/epson_driver; \
     fi && rm -rf /var/lib/apt/lists/*
 
 RUN sed -i 's/Listen localhost:631/Listen 0.0.0.0:631/' /etc/cups/cupsd.conf && \
