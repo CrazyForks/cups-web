@@ -101,8 +101,20 @@ fi
 
 echo "[canon-ufr2] installing ${DEB_PATH}"
 
-# dpkg -i 失败时用 apt-get -f install 兜底处理依赖（与 install-epson-cn.sh 同模式）。
-dpkg -i "${DEB_PATH}" || apt-get install -y -f --no-install-recommends
+# Canon deb 声明依赖 cups-bsd（Debian trixie 已移除，功能合并到 cups-client）
+# 和 libgtk-3-0/libgtk-3-0t64（状态监控 GUI 依赖，无头容器不需要）。
+# 这两个依赖对核心 filter（rastertoufr2）的运行毫无影响，filter 实际
+# 只链接 libcups/libcupsimage（已安装）。
+# 使用 --force-depends 跳过过时的依赖声明，避免 apt-get -f install
+# 把整个包回滚删除（trixie 上的实际表现——无法满足 cups-bsd 时 apt 选择
+# 删除 Canon 包来 "修复" 依赖关系）。
+dpkg -i --force-depends "${DEB_PATH}"
+
+# 验证核心 filter 确实落盘
+if [ ! -f /usr/lib/cups/filter/rastertoufr2 ]; then
+    echo "[canon-ufr2] FATAL: /usr/lib/cups/filter/rastertoufr2 not found after dpkg install"
+    exit 1
+fi
 
 echo "[canon-ufr2] installed Canon UFR II/UFRII LT driver v${CANON_UFR2_VERSION} (${CANON_UFR2_DEB_ARCH})"
 rm -rf /var/lib/apt/lists/*
