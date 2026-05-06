@@ -96,8 +96,14 @@ cups-web/
 │   ├── pom.xml
 │   └── src/
 ├── cups/                          # CUPS 服务镜像
-│   ├── Dockerfile
-│   └── entrypoint.sh
+│   ├── Dockerfile                 # 瘦身版：apt 装依赖 + COPY scripts/ + 调用各 sh
+│   ├── entrypoint.sh              # 容器启动脚本（avahi/ipp-usb/cupsd）
+│   └── scripts/                   # 镜像构建脚本（版本号、URL 硬编码在脚本内）
+│       ├── install-cups.sh        # 源码编译 OpenPrinting/cups 2.4.x
+│       ├── install-escpr2.sh      # 编译 Epson ESCPR2 驱动（仅从仓库 Release 镜像下载）
+│       ├── install-gutenprint.sh  # 安装 printer-driver-gutenprint（跳过 armhf）
+│       ├── install-epson-cn.sh    # Epson 国行专有 .deb（仅 amd64）
+│       └── cleanup-build.sh       # 清理编译工具链 + apt-mark manual 运行时库
 ├── .github/workflows/             # CI：多平台二进制构建与发布
 ├── .aone_copilot/plans/           # 历史开发计划（只增不改的档案）
 ├── data/                          # 运行时数据库（.gitignore）

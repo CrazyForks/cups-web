@@ -5,7 +5,10 @@
 # ① 不再显式安装这些低级库包——它们都是 cups/cups-filters 的依赖，apt 会自动
 #    根据架构拉取正确的包名（如 libcups2t64、libpng16-16t64 等）；
 # ② printer-driver-gutenprint 在 trixie armhf 上已无 binary（gutenprint 的
-#    源码包未对 armhf 构建），因此改为条件安装——仅在 amd64/arm64 上装入。
+#    源码包未对 armhf 构建），因此改为条件安装——见 scripts/install-gutenprint.sh。
+#
+# 构建步骤拆分到 scripts/ 目录的独立 sh 脚本，版本号、URL 等配置硬编码在脚本里，
+# 不通过 ARG 透传——升级版本时直接改对应脚本即可。
 FROM debian:trixie-slim
 
 ARG TARGETARCH
@@ -19,17 +22,9 @@ ENV TZ=Asia/Shanghai
 ENV CUPSADMIN=print
 ENV CUPSPASSWORD=print
 
-# CUPS 版本：从 OpenPrinting/cups 的 GitHub Releases 拉取源码编译。
-# 默认锁定到官方 2.4.x 稳定分支最新版——2.4.x 维持 libcups2 ABI 稳定，
-# 与 Debian trixie 的 cups-filters 可直接链接复用；
-# 3.x 系列已切换到 CMake 构建并移除了经典驱动模型（printer-driver-* 大量失效），
-# 如需切到 3.x 必须同步改写下方的 configure/make 构建步骤。
-# 版本来源：https://github.com/OpenPrinting/cups/releases
-ARG CUPS_VERSION=2.4.19
-
-# ────────────────────────────────────────────────────────────────��[...]
-# 第一阶段：安装编译依赖 + 运行时依赖 + cups-filters。
-# ────────────────────────────────────────────────────────────────��[...]
+# ────────────────────────────────────────────────────────────────────
+# 第一阶段：apt 安装编译依赖 + 运行时依赖 + cups-filters。
+# ────────────────────────────────────────────────────────────────────
 # 这里故意不单独 `apt install cups`——cups-filters 会把 apt 版 cups 作为依赖拉进来，
 # 由它负责创建 lp/lpadmin 用户组、/etc/cups 目录骨架和 systemd unit 文件等；
 # 随后第二阶段用源码编译出的二进制（同样 --prefix=/usr）覆盖掉 apt 版的
@@ -38,8 +33,7 @@ ARG CUPS_VERSION=2.4.19
 # 和所有 printer-driver-* 可以继续工作。
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      # ── 源码编译工具链（第二阶段使用，构建完成后不清理，
-      #    因为后续 ESC/P-R 2 驱动也需要） ──
+      # ── 源码编译工具链（CUPS / ESCPR2 都用到，构建完成后由 cleanup-build.sh 清理） ──
       build-essential \
       autoconf \
       automake \
@@ -96,219 +90,49 @@ RUN apt-get update && \
       avahi-daemon && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ────────────────────────────────────────────────────────────────��[...]
+# ────────────────────────────────────────────────────────────────────
+# 拷贝构建脚本，统一赋予可执行权限。
+# ────────────────────────────────────────────────────────────────────
+# 每个脚本独立一个 RUN，缓存粒度与原来一行 RUN 等价；脚本内容不变时层级缓存复用。
+COPY scripts/ /tmp/build-scripts/
+RUN chmod +x /tmp/build-scripts/*.sh
+
+# ────────────────────────────────────────────────────────────────────
 # 第二阶段：从 OpenPrinting/cups 源码编译并覆盖安装到 /usr。
-# ────────────────────────────────────────────────────────────────�[...]
-# configure 选项尽量贴齐 Debian 打包约定：
-#   --prefix=/usr            覆盖 apt 版 /usr/bin/cupsd、/usr/sbin/cupsd 等；
-#   --libdir=.../multiarch   Debian 多架构系统把 apt 版 libcups.so.2 装到
-#                            /usr/lib/<triplet>/（ldconfig 里优先级高于 /usr/lib），
-#                            如果我们用默认 libdir=/usr/lib 会被 apt 版遮蔽，
-#                            所以显式用 dpkg-architecture 取 triplet 路径，
-#                            让源码版 libcups/libcupsimage 彻底替换 apt 版；
-#   --sysconfdir=/etc        沿用 /etc/cups 配置目录（cupsd.conf、ppd/、ssl/ 等）；
-#   --localstatedir=/var     沿用 /var/{cache,log,spool}/cups 运行时目录；
-#   --with-cups-user=lp      与 Debian cups-daemon 预置的系统用户一致；
-#   --with-cups-group=lp     同上，避免 cupsd 启动时权限错乱；
-#   --with-system-groups=lpadmin  管理员组，与 cups-daemon 预置保持一致；
-#   --enable-libusb/--enable-avahi/--enable-dbus/--enable-gnutls
-#                            开启 USB 直连、mDNS 发现、DBus 通知、TLS，
-#                            对应容器内网络打印 + Airprint/Mopria 场景。
-#
-# 注：GitHub releases 的 tarball 已带 configure 脚本（发布前 bootstrap 过），
-# 不需要再跑 autoreconf；若切到 master 分支 HEAD 源码需先 `./autogen.sh`。
-RUN mkdir -p /tmp/cups-build && cd /tmp/cups-build && \
-    wget -q -O cups.tar.gz \
-      "https://github.com/OpenPrinting/cups/releases/download/v${CUPS_VERSION}/cups-${CUPS_VERSION}-source.tar.gz" && \
-    tar xzf cups.tar.gz --strip-components=1 && \
-    MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" && \
-    ./configure \
-      --prefix=/usr \
-      --libdir=/usr/lib/${MULTIARCH} \
-      --sysconfdir=/etc \
-      --localstatedir=/var \
-      --with-cups-user=lp \
-      --with-cups-group=lp \
-      --with-system-groups=lpadmin \
-      --enable-libusb \
-      --enable-avahi \
-      --enable-dbus \
-      --enable-gnutls && \
-    make -j"$(nproc)" && \
-    make install && \
-    # 刷新动态链接器缓存，让后续步骤链接到源码编译出的 libcups.so.2
-    ldconfig && \
-    cd / && rm -rf /tmp/cups-build && \
-    # 打印源码构建出的 CUPS 版本号，便于 CI 日志核对
-    /usr/sbin/cupsd -V || true
+# ────────────────────────────────────────────────────────────────────
+# 详见 scripts/install-cups.sh
+RUN /tmp/build-scripts/install-cups.sh
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────
 # Epson ESC/P-R 2 驱动：Debian 官方仓库不提供此包，从 Epson 官方源码编译安装。
-# ────────────────────────────────────────────────────────────────�[...]
-# 支持 ET-18100, L8050, L8160, WF-7840 等新款 Epson 喷墨打印机的完整功能（含无边距打印）。
-# 版本更新时需同时修改 ESCPR2_VERSION 和 ESCPR2_UUID（从 Epson 下载中心获取新版本的 URL）。
-#
-# 注：这里不再单独 `apt install libcups2-dev libcupsimage2-dev`——
-# 上一阶段 `make install` 已把 cups/cupsimage 的头文件与 .so 放入 /usr/include 与 /usr/lib，
-# ESC/P-R 2 的 configure 会直接通过 cups-config 找到新编译出的 libcups，
-# 避免 apt 版 -dev 包回踩覆盖源码装好的 /usr/include/cups/*.h。
-#
-# ⚠️ Fail-fast 策略：
-# Epson 下载中心（download-center.epson.com）挂在 Akamai CDN 后面，会对请求做
-# UA/Header/TLS 指纹等多维度风控，出现 HTTP 403 Forbidden 的概率不低——Arch AUR
-# 的 `epson-inkjet-printer-escpr2` PKGBUILD 评论区也一直有人反馈"同一链路换个工具/换个
-# UA 就能下载成功"。所以这里**依次尝试多种下载策略**（wget-Chrome → wget-Firefox
-# → curl-Firefox），任一成功即进入编译；**全部失败则整个 docker build 直接失败**，
-# 避免构建"静默降级"导致发布镜像里缺少 ESCPR2 驱动却无人察觉。
-# 同时 UUID 会被 Epson 定期轮换，若新版本发布后下载仍稳定 403，去
-# https://download-center.epson.com 下载页按 F12 抓新 UUID 更新 ESCPR2_UUID/
-# ESCPR2_VERSION 即可。
-ARG ESCPR2_VERSION=1.2.39
-ARG ESCPR2_UUID=12bbe234-329d-4b3c-922c-e497f25f5e32
-# Chrome UA 串作为首选；若被 Akamai 拦截再回退到简化 Firefox UA（AUR 维护者经验：
-# 有时长 UA 比短 UA 更容易被拦，反之亦然，两个都试）。
-ARG ESCPR2_UA_CHROME="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-ARG ESCPR2_UA_FIREFOX="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
-# 镜像备用：优先从仓库 Release 下载，防止官方 CDN 被 Akamai 拦截导致 403（可由 CI 通过 --build-arg 覆盖）
-ARG ESCPR2_MIRROR_URL="https://github.com/hanxi/cups-web/releases/download/vescpr2-1.2.39/epson-inkjet-printer-escpr2-1.2.39-1.tar.gz"
-# 用 `set -eo pipefail` 保证任何一步失败都让整个 RUN 指令以非零退出码结束，
-# 触发 docker build 立即 abort，避免构建产出缺少 ESCPR2 驱动的"看似成功"镜像。
-RUN set -eo pipefail; \
-    mkdir -p /tmp/escpr2-build && cd /tmp/escpr2-build && \
-    # 优先尝试从仓库 Release 镜像下载（如果提供），否则回退到官方下载中心
-    if [ -n "${ESCPR2_MIRROR_URL}" ]; then \
-      echo "[escpr2] trying mirror ${ESCPR2_MIRROR_URL}"; \
-      curl -fL --retry 3 -o escpr2.tar.gz "${ESCPR2_MIRROR_URL}" || rm -f escpr2.tar.gz; \
-    fi; \
-    if [ ! -f escpr2.tar.gz ]; then \
-      ESCPR2_URL="https://download-center.epson.com/f/module/${ESCPR2_UUID}/epson-inkjet-printer-escpr2-${ESCPR2_VERSION}-1.tar.gz"; \
-      echo "[escpr2] downloading ${ESCPR2_URL}"; \
-      ( wget --tries=3 --timeout=60 --retry-connrefused --user-agent="${ESCPR2_UA_CHROME}" -O escpr2.tar.gz "${ESCPR2_URL}" ) \
-      || ( wget --tries=3 --timeout=60 --retry-connrefused --user-agent="${ESCPR2_UA_FIREFOX}" -O escpr2.tar.gz "${ESCPR2_URL}" ) \
-      || ( curl --user-agent "Firefox" -qgb "" -fL --retry 3 --retry-delay 3 -o escpr2.tar.gz "${ESCPR2_URL}" ); \
-    fi; \
-    # abort if still no tarball (保持 fail-fast 策略)
-    if [ ! -f escpr2.tar.gz ]; then \
-      echo "[escpr2] FATAL: all download attempts failed (HTTP 4xx/5xx or network)"; exit 1; \
-    fi; \
-    # 解包并构建
-    mkdir src && cd src && tar xzf ../escpr2.tar.gz --strip-components=1 && \
-    autoreconf -fi && \
-    # 强制编译器标准回退到 gnu17，避免 C23 把隐式函数声明视为错误
-    export CC="gcc -std=gnu17" && export CXX="g++ -std=gnu17" && \
-    ./configure --prefix=/usr --disable-static CFLAGS="-O2 -std=gnu17" CXXFLAGS="-O2 -std=gnu17" && \
-    make -j"$(nproc)" && make install && \
-    echo "[escpr2] installed version ${ESCPR2_VERSION}" && \
-    cd / && rm -rf /tmp/escpr2-build
+# ────────────────────────────────────────────────────────────────────
+# 详见 scripts/install-escpr2.sh（版本号、镜像 URL 都硬编码在脚本里）
+RUN /tmp/build-scripts/install-escpr2.sh
 
-# ────────────────────────────────────────────────────────────────�[...]
-# 清理编译工具链：CUPS 与 ESC/P-R 2 都已编译安装完毕，构建依赖可以全部清理。
-# ────────────────────────────────────────────────────────────────�[...]
-# 注意只清理 *-dev 头文件包和编译器，保留运行时动态库（如 libavahi-client3、
-# libgnutls30、libssl3、libusb-1.0-0 等），它们是 cupsd 运行期必需的。
-#
-# ⚠️ 陷阱：源码编译出来的 cupsd 不在 apt 依赖图里，`apt-get autoremove` 不知道
-# 它依赖这些运行时库，purge *-dev 后有概率把 libgnutls30 / libldap-* /
-# libdbus-1-3 等作为"孤儿"一起删掉，导致 cupsd 启动时 dlopen 失败。
-# 解决：先 `apt-mark manual` 把这些运行时库标记为用户显式安装，autoremove
-# 就不会碰它们了。
-#
-# ⚠️ 包名跨版本差异：Debian trixie 升级了 OpenLDAP（libldap-2.5-0 → libldap-2.6-0）
-# 并做了 t64 ABI 迁移，部分包名带 t64 后缀；不同架构（amd64/arm64/armhf）
-# 实际装到的包名可能也不同。所以用 for 循环逐个 apt-mark，用
-# `dpkg-query` 先检查"包已安装"再 mark，不存在的包静默跳过，保证
-# 整条命令在任意 Debian 版本 / 架构下都不会因为找不到某个包而整体 exit 100。
-RUN set -eux; \
-    for pkg in \
-      libavahi-client3 \
-      libavahi-common3 \
-      libdbus-1-3 \
-      libgnutls30 \
-      libkrb5-3 \
-      libldap-2.5-0 libldap-2.6-0 libldap-2.6-0t64 \
-      libpam0g libpam0t64 \
-      libssl3 libssl3t64 \
-      libsystemd0 \
-      libusb-1.0-0 \
-      zlib1g \
-    ; do \
-      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then \
-        apt-mark manual "$pkg"; \
-      fi; \
-    done; \
-    # purge 同样用循环，避免某个 -dev 包在当前架构缺失时整批 abort
-    for pkg in \
-      build-essential \
-      autoconf \
-      automake \
-      libtool \
-      pkg-config \
-      libavahi-client-dev \
-      libavahi-common-dev \
-      libdbus-1-dev \
-      libgnutls28-dev \
-      libkrb5-dev \
-      libldap-dev libldap2-dev \
-      libpam0g-dev \
-      libssl-dev \
-      libsystemd-dev \
-      libusb-1.0-0-dev \
-      zlib1g-dev \
-    ; do \
-      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then \
-        apt-get purge -y "$pkg"; \
-      fi; \
-    done; \
-    apt-get autoremove -y; \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# ────────────────────────────────────────────────────────────────────
+# 清理编译工具链。
+# ────────────────────────────────────────────────────────────────────
+# 详见 scripts/cleanup-build.sh
+RUN /tmp/build-scripts/cleanup-build.sh
 
-# printer-driver-gutenprint 在 trixie armhf 上没有 binary 包（gutenprint 的
-# 链接依赖 libgutenprint9 未完成 t64 迁移），仅在 amd64/arm64 上安装。
-# armhf 用户仍可通过 printer-driver-all 推荐的其他驱动覆盖大部分打印机。
-RUN if [ "${TARGETARCH}" != "arm" ]; then \
-      apt-get update && \
-      apt-get install -y --no-install-recommends printer-driver-gutenprint && \
-      apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    fi
+# ────────────────────────────────────────────────────────────────────
+# printer-driver-gutenprint：仅 amd64/arm64 安装。
+# ────────────────────────────────────────────────────────────────────
+# 详见 scripts/install-gutenprint.sh
+RUN /tmp/build-scripts/install-gutenprint.sh
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────
 # Epson 国行私有驱动（仅 amd64）：best-effort 安装。
-# ────────────────────────────────────────────────────────────────�[...]
-# `epson-inkjet-printer-201601w` 与 `epson-printer-utility` 是 Epson 中国区
-# 发布的**闭源专有** .deb 包（无源码，无 arm64/armhf 二进制），覆盖 L380/L455
-# 等国行早期喷墨机型。对应功能大部分可以被 Debian 自带的 `printer-driver-escpr`
-# 覆盖，但原厂 PPD 在墨水检测、尺寸预设等细节上更完整。
-#
-# ⚠️ 与 ESCPR2 同样的坑：download-center.epson.com.cn 的 UUID 会定期轮换，
-# URL 失效时 wget 退出码 8（HTTP 4xx）会让整个 docker build abort。
-# 此处采用 **fail-fast**：下载 / dpkg 任一步失败则 docker build 立刻中断，
-# 避免发布镜像里缺少国行驱动却静默成功。arm64/armhf 本来就跳过整个 RUN 块，
-# 不受影响。
-# 升级方法：去 https://download-center.epson.com.cn 找对应机型按 F12 抓新
-# UUID，更新下面两个 ARG 即可。
-ARG EPSON_PROP_DRIVER_UUID=81976474-cb4d-4b75-a0d8-ebc9ebde70d0
-ARG EPSON_PROP_DRIVER_DEB=epson-inkjet-printer-201601w_1.0.1-1_amd64.deb
-ARG EPSON_PROP_UTILITY_UUID=b04dc5b0-cb78-4ce7-98c8-06731fb74062
-ARG EPSON_PROP_UTILITY_DEB=epson-printer-utility_1.2.2-1_amd64.deb
-ARG EPSON_PROP_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-RUN if [ "${TARGETARCH}" = "amd64" ]; then \
-      set -eo pipefail; \
-      mkdir -p /tmp/epson_driver && cd /tmp/epson_driver && \
-      EPSON_DRV_URL="https://download-center.epson.com.cn/f/module/${EPSON_PROP_DRIVER_UUID}/${EPSON_PROP_DRIVER_DEB}" && \
-      EPSON_UTIL_URL="https://download-center.epson.com.cn/f/module/${EPSON_PROP_UTILITY_UUID}/${EPSON_PROP_UTILITY_DEB}" && \
-      echo "[epson-prop] downloading ${EPSON_DRV_URL}" && \
-      wget --tries=3 --timeout=60 --retry-connrefused \
-           --user-agent="${EPSON_PROP_UA}" \
-           -O "${EPSON_PROP_DRIVER_DEB}" "${EPSON_DRV_URL}" && \
-      echo "[epson-prop] downloading ${EPSON_UTIL_URL}" && \
-      wget --tries=3 --timeout=60 --retry-connrefused \
-           --user-agent="${EPSON_PROP_UA}" \
-           -O "${EPSON_PROP_UTILITY_DEB}" "${EPSON_UTIL_URL}" && \
-      ( dpkg -i ./*.deb || apt-get install -y -f --no-install-recommends ) && \
-      echo "[epson-prop] installed Epson CN proprietary driver + utility" && \
-      cd / && rm -rf /tmp/epson_driver; \
-    fi && rm -rf /var/lib/apt/lists/*
+# ────────────────────────────────────────────────────────────────────
+# 详见 scripts/install-epson-cn.sh（UUID/.deb 文件名硬编码在脚本里）
+RUN /tmp/build-scripts/install-epson-cn.sh
 
+# 构建脚本使命完成，清理临时目录
+RUN rm -rf /tmp/build-scripts
+
+# ────────────────────────────────────────────────────────────────────
+# cupsd.conf：放开监听 + 浏览，并备份默认配置供 entrypoint 还原。
+# ────────────────────────────────────────────────────────────────────
 RUN sed -i 's/Listen localhost:631/Listen 0.0.0.0:631/' /etc/cups/cupsd.conf && \
     sed -i 's/Browsing Off/Browsing On/' /etc/cups/cupsd.conf && \
     sed -i 's/<Location \/>/<Location \/>\n  Allow All/' /etc/cups/cupsd.conf && \
