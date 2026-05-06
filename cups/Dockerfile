@@ -4,8 +4,8 @@
 # 把 libcups2/libcupsimage2/libpng16-16 等包重命名为 t64 后缀版本。现在的做法是：
 # ① 不再显式安装这些低级库包——它们都是 cups/cups-filters 的依赖，apt 会自动
 #    根据架构拉取正确的包名（如 libcups2t64、libpng16-16t64 等）；
-# ② printer-driver-gutenprint 在 trixie armhf 上已无 binary（gutenprint 源码包
-#    未对 armhf 构建），因此改为条件安装——仅在 amd64/arm64 上装入。
+# ② printer-driver-gutenprint 在 trixie armhf 上已无 binary（gutenprint 的
+#    源码包未对 armhf 构建），因此改为条件安装——仅在 amd64/arm64 上装入。
 FROM debian:trixie-slim
 
 ARG TARGETARCH
@@ -27,9 +27,9 @@ ENV CUPSPASSWORD=print
 # 版本来源：https://github.com/OpenPrinting/cups/releases
 ARG CUPS_VERSION=2.4.19
 
-# ──────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────��[...]
 # 第一阶段：安装编译依赖 + 运行时依赖 + cups-filters。
-# ──────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────��[...]
 # 这里故意不单独 `apt install cups`——cups-filters 会把 apt 版 cups 作为依赖拉进来，
 # 由它负责创建 lp/lpadmin 用户组、/etc/cups 目录骨架和 systemd unit 文件等；
 # 随后第二阶段用源码编译出的二进制（同样 --prefix=/usr）覆盖掉 apt 版的
@@ -96,9 +96,9 @@ RUN apt-get update && \
       avahi-daemon && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ──────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────��[...]
 # 第二阶段：从 OpenPrinting/cups 源码编译并覆盖安装到 /usr。
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # configure 选项尽量贴齐 Debian 打包约定：
 #   --prefix=/usr            覆盖 apt 版 /usr/bin/cupsd、/usr/sbin/cupsd 等；
 #   --libdir=.../multiarch   Debian 多架构系统把 apt 版 libcups.so.2 装到
@@ -142,9 +142,9 @@ RUN mkdir -p /tmp/cups-build && cd /tmp/cups-build && \
     # 打印源码构建出的 CUPS 版本号，便于 CI 日志核对
     /usr/sbin/cupsd -V || true
 
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # Epson ESC/P-R 2 驱动：Debian 官方仓库不提供此包，从 Epson 官方源码编译安装。
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # 支持 ET-18100, L8050, L8160, WF-7840 等新款 Epson 喷墨打印机的完整功能（含无边距打印）。
 # 版本更新时需同时修改 ESCPR2_VERSION 和 ESCPR2_UUID（从 Epson 下载中心获取新版本的 URL）。
 #
@@ -158,7 +158,7 @@ RUN mkdir -p /tmp/cups-build && cd /tmp/cups-build && \
 # UA/Header/TLS 指纹等多维度风控，出现 HTTP 403 Forbidden 的概率不低——Arch AUR
 # 的 `epson-inkjet-printer-escpr2` PKGBUILD 评论区也一直有人反馈"同一链路换个工具/换个
 # UA 就能下载成功"。所以这里**依次尝试多种下载策略**（wget-Chrome → wget-Firefox
-# → curl-Firefox-qgb），任一成功即进入编译；**全部失败则整个 docker build 直接失败**，
+# → curl-Firefox），任一成功即进入编译；**全部失败则整个 docker build 直接失败**，
 # 避免构建"静默降级"导致发布镜像里缺少 ESCPR2 驱动却无人察觉。
 # 同时 UUID 会被 Epson 定期轮换，若新版本发布后下载仍稳定 403，去
 # https://download-center.epson.com 下载页按 F12 抓新 UUID 更新 ESCPR2_UUID/
@@ -169,63 +169,41 @@ ARG ESCPR2_UUID=12bbe234-329d-4b3c-922c-e497f25f5e32
 # 有时长 UA 比短 UA 更容易被拦，反之亦然，两个都试）。
 ARG ESCPR2_UA_CHROME="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ARG ESCPR2_UA_FIREFOX="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+# 镜像备用：优先从仓库 Release 下载，防止官方 CDN 被 Akamai 拦截导致 403（可由 CI 通过 --build-arg 覆盖）
+ARG ESCPR2_MIRROR_URL="https://github.com/hanxi/cups-web/releases/download/vescpr2-1.2.39/epson-inkjet-printer-escpr2-1.2.39-1.tar.gz"
 # 用 `set -eo pipefail` 保证任何一步失败都让整个 RUN 指令以非零退出码结束，
 # 触发 docker build 立即 abort，避免构建产出缺少 ESCPR2 驱动的"看似成功"镜像。
 RUN set -eo pipefail; \
     mkdir -p /tmp/escpr2-build && cd /tmp/escpr2-build && \
-    ESCPR2_URL="https://download-center.epson.com/f/module/${ESCPR2_UUID}/epson-inkjet-printer-escpr2-${ESCPR2_VERSION}-1.tar.gz" && \
-    echo "[escpr2] downloading ${ESCPR2_URL}" && \
-    # 依次尝试三种下载策略，任一成功立即跳出；全部失败则整个 RUN 失败（docker build abort） \
-    ( \
-      echo "[escpr2] attempt 1: wget + Chrome UA" && \
-      wget --tries=3 --timeout=60 --retry-connrefused \
-           --user-agent="${ESCPR2_UA_CHROME}" \
-           -O escpr2.tar.gz "${ESCPR2_URL}" \
-    ) || ( \
-      echo "[escpr2] attempt 2: wget + Firefox UA" && \
-      wget --tries=3 --timeout=60 --retry-connrefused \
-           --user-agent="${ESCPR2_UA_FIREFOX}" \
-           -O escpr2.tar.gz "${ESCPR2_URL}" \
-    ) || ( \
-      # 与 AUR PKGBUILD 对齐的 curl 调用：-qgb "" 忽略 ~/.curlrc 且用空 cookie jar，\
-      # -fL 在遇到 4xx/重定向时表现更贴近浏览器；不少反馈 curl 比 wget 更能过 Akamai。\
-      echo "[escpr2] attempt 3: curl + Firefox UA" && \
-      curl --user-agent "Firefox" -qgb "" -fL --retry 3 --retry-delay 3 \
-           -o escpr2.tar.gz "${ESCPR2_URL}" \
-    ) || { \
-      echo "[escpr2] FATAL: all download attempts failed (HTTP 403 or network error). Retry the build (Akamai CDN blocks are often transient) or update ESCPR2_UUID/ESCPR2_VERSION per https://download-center.epson.com" >&2; \
-      exit 1; \
-    }; \
-    mkdir src && cd src && \
-    tar xzf ../escpr2.tar.gz --strip-components=1 && \
-    # ⚠️ Debian trixie 的 automake 已经升级到 1.17，而 Epson 这份 tarball 是用\
-    # automake-1.16 打出来的——tar 解包会保留原始 mtime，make 检测到 Makefile.am\
-    # 比 Makefile.in 新（或 aclocal.m4 比 configure 新）时会触发 automake 重跑，\
-    # 此时 autotools 的 `missing` 脚本发现系统里只有 `automake-1.17`、没有\
-    # `automake-1.16`，直接 exit 127，make 以 `Error 127` 失败。\
-    # 修复：在 configure 之前用当前安装的 autotools（autoconf/automake/libtool\
-    # 都在上游阶段的 build-essential 链里装过）重新生成 configure + Makefile.in\
-    # + aclocal.m4，让构建系统绑定到容器里实际存在的 automake-1.17。\
+    # 优先尝试从仓库 Release 镜像下载（如果提供），否则回退到官方下载中心
+    if [ -n "${ESCPR2_MIRROR_URL}" ]; then \
+      echo "[escpr2] trying mirror ${ESCPR2_MIRROR_URL}"; \
+      curl -fL --retry 3 -o escpr2.tar.gz "${ESCPR2_MIRROR_URL}" || rm -f escpr2.tar.gz; \
+    fi; \
+    if [ ! -f escpr2.tar.gz ]; then \
+      ESCPR2_URL="https://download-center.epson.com/f/module/${ESCPR2_UUID}/epson-inkjet-printer-escpr2-${ESCPR2_VERSION}-1.tar.gz"; \
+      echo "[escpr2] downloading ${ESCPR2_URL}"; \
+      ( wget --tries=3 --timeout=60 --retry-connrefused --user-agent="${ESCPR2_UA_CHROME}" -O escpr2.tar.gz "${ESCPR2_URL}" ) \
+      || ( wget --tries=3 --timeout=60 --retry-connrefused --user-agent="${ESCPR2_UA_FIREFOX}" -O escpr2.tar.gz "${ESCPR2_URL}" ) \
+      || ( curl --user-agent "Firefox" -qgb "" -fL --retry 3 --retry-delay 3 -o escpr2.tar.gz "${ESCPR2_URL}" ); \
+    fi; \
+    # abort if still no tarball (保持 fail-fast 策略)
+    if [ ! -f escpr2.tar.gz ]; then \
+      echo "[escpr2] FATAL: all download attempts failed (HTTP 4xx/5xx or network)"; exit 1; \
+    fi; \
+    # 解包并构建
+    mkdir src && cd src && tar xzf ../escpr2.tar.gz --strip-components=1 && \
     autoreconf -fi && \
-    # ⚠️ gcc 15（Debian trixie 起）默认 C23，escpr2 源码里还保留了 C89/C99 风格的\
-    # 隐式函数声明（例如 bug_x86_64.patch 里声明 SendStartJob() 不带形参）、\
-    # 隐式 int 返回值等，在 C23 下由警告升级为硬错误，make 会以 exit 2 失败。\
-    # Arch AUR 社区在 2025-05 已确认修复方案：通过环境变量包装编译器，在编译时\
-    # 统一应用 `-std=gnu17` 标志，显式把语言标准回退到 C17，既保留 GNU 扩展\
-    # 又绕开 C23 严格模式。参考：https://bbs.archlinux.org/viewtopic.php?id=305318 \
-    export CC="gcc -std=gnu17" && \
-    export CXX="g++ -std=gnu17" && \
-    ./configure --prefix=/usr --disable-static \
-                CFLAGS="-O2" \
-                CXXFLAGS="-O2" && \
-    make -j"$(nproc)" && \
-    make install && \
+    # 强制编译器标准回退到 gnu17，避免 C23 把隐式函数声明视为错误
+    export CC="gcc -std=gnu17" && export CXX="g++ -std=gnu17" && \
+    ./configure --prefix=/usr --disable-static CFLAGS="-O2 -std=gnu17" CXXFLAGS="-O2 -std=gnu17" && \
+    make -j"$(nproc)" && make install && \
     echo "[escpr2] installed version ${ESCPR2_VERSION}" && \
     cd / && rm -rf /tmp/escpr2-build
 
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # 清理编译工具链：CUPS 与 ESC/P-R 2 都已编译安装完毕，构建依赖可以全部清理。
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # 注意只清理 *-dev 头文件包和编译器，保留运行时动态库（如 libavahi-client3、
 # libgnutls30、libssl3、libusb-1.0-0 等），它们是 cupsd 运行期必需的。
 #
@@ -293,9 +271,9 @@ RUN if [ "${TARGETARCH}" != "arm" ]; then \
       apt-get clean && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # Epson 国行私有驱动（仅 amd64）：best-effort 安装。
-# ─────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────�[...]
 # `epson-inkjet-printer-201601w` 与 `epson-printer-utility` 是 Epson 中国区
 # 发布的**闭源专有** .deb 包（无源码，无 arm64/armhf 二进制），覆盖 L380/L455
 # 等国行早期喷墨机型。对应功能大部分可以被 Debian 自带的 `printer-driver-escpr`
