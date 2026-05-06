@@ -104,6 +104,7 @@ cups-web/
 │       ├── install-gutenprint.sh  # 安装 printer-driver-gutenprint（跳过 armhf）
 │       ├── install-epson-cn.sh    # Epson 国行专有 .deb（仅 amd64）
 │       ├── install-canon-ufr2.sh  # Canon UFR II/UFRII LT 官方驱动 .deb（amd64 + arm64，armhf 跳过）
+│       ├── install-konica-bizhub.sh # 柯尼卡美能达 bizhub 3000MF 驱动 .deb（amd64 + arm64，源 .7z 需 p7zip-full）
 │       └── cleanup-build.sh       # 清理编译工具链 + apt-mark manual 运行时库
 ├── .github/workflows/             # CI：多平台二进制构建与发布
 ├── .aone_copilot/plans/           # 历史开发计划（只增不改的档案）
