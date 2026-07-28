@@ -51,8 +51,14 @@ case "${ARCH}" in
         KM_DEB_ARCH="arm64"
         ;;
     *)
-        echo "[konica-bizhub] skip: arch=${ARCH} (no ${ARCH} binary; supported: amd64/arm64)"
-        exit 0
+        # ── 退出码约定（全部 install-*.sh 共同遵守）───────────────────
+        #   0 = 安装成功
+        #   3 = 当前 CPU 架构不支持该驱动（厂商未提供该架构二进制）
+        #   其他非零 = 真正的失败
+        # 必须用 3 而**不是** 0：driver-install 对退出码 0 会照常写
+        # manifest.txt，Web UI 于是显示"已安装"，用户以为驱动可用。
+        echo "[konica-bizhub] unsupported arch=${ARCH} (no ${ARCH} binary; supported: amd64/arm64)"
+        exit 3
         ;;
 esac
 
@@ -96,7 +102,18 @@ fi
 echo "[konica-bizhub] installing ${DEB_PATH}"
 
 # dpkg -i 失败时用 apt-get -f install 兜底处理依赖（与 install-epson-cn.sh 同模式）。
-dpkg -i "${DEB_PATH}" || apt-get install -y -f --no-install-recommends
+# ⚠️ 必须先 apt-get update：apt 需要包索引才能下载缺失依赖，AIO 运行时的镜像里
+# /var/lib/apt/lists 可能是空的（构建期为省体积清过）。
+if ! dpkg -i "${DEB_PATH}"; then
+    echo "[konica-bizhub] dpkg reported dependency issues, fixing with apt-get -f install"
+    apt-get update
+    apt-get install -y -f --no-install-recommends
+fi
 
 echo "[konica-bizhub] installed Konica Minolta bizhub 3000MF driver v${KM_VERSION} (${KM_DEB_ARCH})"
-rm -rf /var/lib/apt/lists/*
+# 只在构建期（非 AIO）清 apt 索引省镜像体积。
+# ⚠️ 在运行中的容器里清空 /var/lib/apt/lists 会让**后续安装的其他驱动**因为
+# 没有包索引而 apt-get install 失败（"连续装两个驱动"直接翻车）。
+if [ "${CUPS_AIO:-0}" != "1" ]; then
+    rm -rf /var/lib/apt/lists/*
+fi

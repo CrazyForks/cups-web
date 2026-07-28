@@ -16,11 +16,18 @@
 
 set -eo pipefail
 
-# 仅 amd64 安装；其他架构静默退出（exit 0，不影响整个 build）
+# 仅 amd64 安装。
+# ── 退出码约定（全部 install-*.sh 共同遵守）───────────────────────────
+#   0 = 安装成功
+#   3 = 当前 CPU 架构不支持该驱动（厂商未提供该架构二进制）
+#   其他非零 = 真正的失败（下载 / dpkg / 编译失败等）
+# 这里必须用 3 而**不是** 0：driver-install 对退出码 0 会照常写 manifest.txt，
+# Web UI 于是显示"已安装"，用户以为驱动可用（实际什么都没装）。用 3 让上层
+# 能明确区分"本架构不支持"和"真失败"。
 ARCH="$(dpkg --print-architecture)"
 if [ "${ARCH}" != "amd64" ]; then
-    echo "[epson-cn] skip: arch=${ARCH} (only amd64 supported)"
-    exit 0
+    echo "[epson-cn] unsupported arch=${ARCH} (only amd64 supported)"
+    exit 3
 fi
 
 # ────────────────────────────────────────────────────────────────────
@@ -51,8 +58,19 @@ wget --tries=3 --timeout=60 --retry-connrefused \
      --user-agent="${EPSON_PROP_UA}" \
      -O "${EPSON_PROP_UTILITY_DEB}" "${EPSON_UTIL_URL}"
 
-# dpkg -i 失败时用 apt-get -f install 兜底处理依赖
-dpkg -i ./*.deb || apt-get install -y -f --no-install-recommends
+# dpkg -i 失败时用 apt-get -f install 兜底处理依赖。
+# ⚠️ 必须先 apt-get update：apt 需要包索引才能下载缺失依赖，AIO 运行时的镜像里
+# /var/lib/apt/lists 可能是空的（构建期为省体积清过）。
+if ! dpkg -i ./*.deb; then
+    echo "[epson-cn] dpkg reported dependency issues, fixing with apt-get -f install"
+    apt-get update
+    apt-get install -y -f --no-install-recommends
+fi
 
 echo "[epson-cn] installed Epson CN proprietary driver + utility"
-rm -rf /var/lib/apt/lists/*
+# 只在构建期（非 AIO）清 apt 索引省镜像体积。
+# ⚠️ 在运行中的容器里清空 /var/lib/apt/lists 会让**后续安装的其他驱动**因为
+# 没有包索引而 apt-get install 失败（"连续装两个驱动"直接翻车）。
+if [ "${CUPS_AIO:-0}" != "1" ]; then
+    rm -rf /var/lib/apt/lists/*
+fi

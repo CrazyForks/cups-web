@@ -11,7 +11,13 @@ if [ "$1" = "--installed" ]; then
 fi
 
 # Detect current architecture
-CURRENT_ARCH="$(dpkg-architecture -qDEB_HOST_ARCH 2>/dev/null || uname -m)"
+# ⚠️ 不能用 dpkg-architecture：它属于 dpkg-dev 包，runtime 镜像**没有安装**，
+# 调用总是失败 → 回落到 uname -m 得到 aarch64/armv7l，而 metadata.txt 里
+# driver-install 写的是 Debian 架构名 arm64/armhf，两者永远不相等，
+# 于是每个已安装驱动都被误报"架构不一致"警告。
+# `dpkg --print-architecture` 由 dpkg 本体提供，runtime 一定有，且与
+# install-*.sh / driver-install.sh 的判断基准完全一致。
+CURRENT_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 
 echo "=========================================="
 echo "  CUPS Driver Manager"

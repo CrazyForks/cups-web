@@ -35,8 +35,35 @@ ESCPR2_MIRROR_URL="https://github.com/hanxi/cups-web/releases/download/cups-driv
 ESCPR2_DEB_AMD64_URL="https://github.com/hanxi/cups-web/releases/download/cups-driver/epson-inkjet-printer-escpr2_1.2.39-1_amd64.deb"
 ESCPR2_DEB_ARMHF_URL="https://github.com/hanxi/cups-web/releases/download/cups-driver/epson-inkjet-printer-escpr2_1.2.39_armhf.deb"
 
+BUILD_DEPS="build-essential autoconf automake libtool gcc pkg-config libcups2-dev"
+_AIO_DEPS_INSTALLED=0
+BUILD_DIR=""
+
+# ── 统一的 EXIT 清理函数 ───────────────────────────────────────────────
+# ⚠️ bash 对同一信号只保留**最后一次**注册的 handler。老实现在这里先
+# `trap 'rm -rf "${BUILD_DIR}"' EXIT`，源码编译分支后面又注册了 AIO 清理
+# trap，把前者覆盖掉 → 临时构建目录泄漏（几十 MB 留在容器 /tmp 里）。
+# 反过来若顺序相反则编译依赖永不卸载，会让 driver-install 把整条工具链写进
+# manifest（卸载驱动时删掉系统文件）。
+# 所以本脚本**全局只允许一个 EXIT trap**，所有清理动作都写进这个函数。
+_cleanup() {
+    local rc=$?
+    if [ -n "${BUILD_DIR}" ]; then
+        rm -rf "${BUILD_DIR}"
+    fi
+    if [ "${_AIO_DEPS_INSTALLED}" = "1" ]; then
+        echo "[escpr2] AIO mode: cleaning up build dependencies..."
+        # shellcheck disable=SC2086 # BUILD_DEPS 是有意的空格分隔包名列表
+        apt-get purge -y --auto-remove ${BUILD_DEPS} 2>/dev/null || true
+        apt-get clean 2>/dev/null || true
+        # 注意：AIO（运行中的容器）里**不能**删 /var/lib/apt/lists——后续安装
+        # 别的驱动时 apt-get install 会因为没有索引而失败。
+    fi
+    return $rc
+}
+trap _cleanup EXIT
+
 BUILD_DIR="$(mktemp -d /tmp/escpr2-build.XXXXXX)"
-trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 cd "${BUILD_DIR}"
 
@@ -65,10 +92,22 @@ if [ -n "${ESCPR2_DEB_URL}" ]; then
     echo "[escpr2] downloading from mirror ${ESCPR2_DEB_URL}"
     curl -fL --retry 3 --retry-delay 3 -o "${ESCPR2_DEB_FILE}" "${ESCPR2_DEB_URL}"
 
-    dpkg -i "${ESCPR2_DEB_FILE}" || apt-get install -y -f --no-install-recommends
+    # dpkg -i 报依赖问题时用 apt-get -f install 兜底。
+    # ⚠️ 必须先 apt-get update：apt 需要包索引才能下载缺失的依赖，而 AIO 运行时
+    # 的镜像里 /var/lib/apt/lists 可能是空的（构建期为省体积清过）。
+    if ! dpkg -i "${ESCPR2_DEB_FILE}"; then
+        echo "[escpr2] dpkg reported dependency issues, fixing with apt-get -f install"
+        apt-get update
+        apt-get install -y -f --no-install-recommends
+    fi
 
     echo "[escpr2] installed version ${ESCPR2_VERSION} (${ARCH} prebuilt deb)"
-    rm -rf /var/lib/apt/lists/*
+    # 只在构建期（非 AIO）清 apt 索引省镜像体积。
+    # ⚠️ 在运行中的容器里清空 /var/lib/apt/lists 会让**后续安装的其他驱动**因为
+    # 没有包索引而 apt-get install 失败（"连续装两个驱动"直接翻车）。
+    if [ "${CUPS_AIO:-0}" != "1" ]; then
+        rm -rf /var/lib/apt/lists/*
+    fi
     exit 0
 fi
 
@@ -77,17 +116,13 @@ fi
 # ────────────────────────────────────────────────────────────────────
 
 # ── AIO 模式：自行管理编译依赖（单容器部署时 runtime 镜像不含编译工具）──
+# 卸载逻辑在文件头部的统一 _cleanup 里（这里**不要**再注册 EXIT trap）。
 if [ "${CUPS_AIO:-0}" = "1" ]; then
     echo "[escpr2] AIO mode: installing build dependencies..."
     apt-get update
-    apt-get install -y --no-install-recommends build-essential autoconf automake libtool gcc pkg-config libcups2-dev
-    _CUPS_AIO_CLEANUP() {
-        echo "[escpr2] AIO mode: cleaning up build dependencies..."
-        apt-get purge -y --auto-remove build-essential autoconf automake libtool gcc pkg-config libcups2-dev 2>/dev/null || true
-        apt-get clean 2>/dev/null || true
-        rm -rf /var/lib/apt/lists/*
-    }
-    trap '_CUPS_AIO_CLEANUP' EXIT
+    # shellcheck disable=SC2086
+    apt-get install -y --no-install-recommends ${BUILD_DEPS}
+    _AIO_DEPS_INSTALLED=1
 fi
 
 echo "[escpr2] arch=${ARCH} → no prebuilt deb, building from source"

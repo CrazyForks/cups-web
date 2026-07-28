@@ -14,18 +14,42 @@
 
 set -eo pipefail
 
+BUILD_DEPS="build-essential autoconf automake libtool gcc pkg-config git"
+_AIO_DEPS_INSTALLED=0
+BUILD_DIR=""
+
+# ── 统一的 EXIT 清理函数 ───────────────────────────────────────────────
+# ⚠️ bash 对同一信号只保留**最后一次**注册的 handler。老实现先 `trap
+# '_CUPS_AIO_CLEANUP' EXIT` 再 `trap 'rm -rf "${BUILD_DIR}"' EXIT`，后者直接
+# 把前者覆盖掉 → build-essential/gcc 等编译依赖**永不卸载**。这不只是"镜像
+# 变大"：driver-install 会把所有新装包（gcc、binutils、libc6-dev…）的文件
+# 记进 manifest 并拷进 .drivers，卸载驱动时按 manifest 逐个 rm，把编译工具链
+# 和系统库一起删掉，容器直接残废。
+# 所以本脚本**全局只允许一个 EXIT trap**，所有清理动作都写进这个函数。
+_cleanup() {
+    local rc=$?
+    if [ -n "${BUILD_DIR}" ]; then
+        rm -rf "${BUILD_DIR}"
+    fi
+    if [ "${_AIO_DEPS_INSTALLED}" = "1" ]; then
+        echo "[canon-capt] AIO mode: cleaning up build dependencies..."
+        # shellcheck disable=SC2086 # BUILD_DEPS 是有意的空格分隔包名列表
+        apt-get purge -y --auto-remove ${BUILD_DEPS} 2>/dev/null || true
+        apt-get clean 2>/dev/null || true
+        # 注意：AIO（运行中的容器）里**不能**删 /var/lib/apt/lists——后续安装
+        # 别的驱动时 apt-get install 会因为没有索引而失败。构建期才需要省体积。
+    fi
+    return $rc
+}
+trap _cleanup EXIT
+
 # ── AIO 模式：自行管理编译依赖（单容器部署时 runtime 镜像不含编译工具）──
 if [ "${CUPS_AIO:-0}" = "1" ]; then
     echo "[canon-capt] AIO mode: installing build dependencies..."
     apt-get update
-    apt-get install -y --no-install-recommends build-essential autoconf automake libtool gcc pkg-config git
-    _CUPS_AIO_CLEANUP() {
-        echo "[canon-capt] AIO mode: cleaning up build dependencies..."
-        apt-get purge -y --auto-remove build-essential autoconf automake libtool gcc pkg-config git 2>/dev/null || true
-        apt-get clean 2>/dev/null || true
-        rm -rf /var/lib/apt/lists/*
-    }
-    trap '_CUPS_AIO_CLEANUP' EXIT
+    # shellcheck disable=SC2086
+    apt-get install -y --no-install-recommends ${BUILD_DEPS}
+    _AIO_DEPS_INSTALLED=1
 fi
 
 # ────────────────────────────────────────────────────────────────────
@@ -38,7 +62,6 @@ CANON_CAPT_BRANCH="master"
 # 下载 & 编译
 # ────────────────────────────────────────────────────────────────────
 BUILD_DIR="$(mktemp -d /tmp/canon-capt-build.XXXXXX)"
-trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 cd "${BUILD_DIR}"
 

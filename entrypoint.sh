@@ -4,7 +4,12 @@ set -e
 # ══════════════════════════════════════════════════════════════
 # 1. Restore persisted drivers
 # ══════════════════════════════════════════════════════════════
-/usr/local/bin/restore-drivers
+# 驱动恢复是"尽力而为"的操作：快照目录可能只读、可能是旧版本写坏的快照、
+# 目标路径可能已被别的包占用成目录。这些都不该阻塞 cupsd / cups-web 启动
+# （否则容器起不来，用户连 Web UI 都进不去，无法自救删掉坏驱动）。
+# restore-drivers 自身已不使用 set -e 并会汇总失败数，这里再加一层 `|| true`
+# 语义的兜底，防止它因意外信号/非零退出把 set -e 的 entrypoint 带崩。
+/usr/local/bin/restore-drivers || echo "[entrypoint] WARN: restore-drivers 部分失败，继续启动"
 
 # ══════════════════════════════════════════════════════════════
 # 2. CUPS admin user setup (from cups/entrypoint.sh)
@@ -126,17 +131,50 @@ fi
 # ══════════════════════════════════════════════════════════════
 # 7. Start cupsd in background with auto-restart watchdog
 # ══════════════════════════════════════════════════════════════
-/usr/sbin/cupsd -f &
-CUPSD_PID=$!
-
-# Watchdog: restart cupsd if it exits
+# ── 为什么 cupsd 必须在 watchdog 子 shell **内部**前台启动 ────────────────
+# bash 的 `wait` 只能等待**当前 shell 自己的子进程**。如果在主 shell 里
+# `cupsd -f &` 拿到 PID，再在子 shell 里 `wait $CUPSD_PID`，那个 PID 对子
+# shell 来说是"兄弟进程"而不是子进程，bash 会立刻返回 127（not a child of
+# this shell）而不是阻塞等待。老实现用 `|| true` 把这个错误吞掉，于是
+# 循环立即往下走 → sleep 2 → 再拉一个 cupsd → 631 端口已被占用，新进程
+# 秒退 → 每 2 秒 fork 一次，形成重启风暴、日志刷满。
+#
+# 正确做法：让 cupsd 在 watchdog 子 shell 内以**前台**方式运行。这样它就是
+# 子 shell 的直接子进程，子 shell 会在 cupsd 真正退出时才继续，`$?` 也是
+# cupsd 的真实退出码。整个子 shell 再 `&` 到后台，不阻塞后续启动步骤。
+# ⚠️ 后人修改注意：不要把 `/usr/sbin/cupsd -f` 挪到子 shell 外面再配
+# `wait`，那会退回到上面描述的 127 死循环。
+#
+# ── 失败退避（防止配置错误导致无限刷屏）────────────────────────────────
+# cupsd 若因配置错误（cupsd.conf 语法错、端口被宿主占用、权限问题）启动即退，
+# 无限重试只会刷满日志。这里统计"短命退出"（存活 < CUPSD_MIN_UPTIME 秒）的
+# 连续次数，达到 CUPSD_MAX_FAST_FAILS 次就打印醒目错误并彻底放弃重启；
+# 只要有一次存活超过阈值（说明是偶发崩溃而非配置问题）就把计数器清零。
+CUPSD_MIN_UPTIME=5
+CUPSD_MAX_FAST_FAILS=5
 (
+    fast_fails=0
     while true; do
-        wait $CUPSD_PID 2>/dev/null || true
-        echo "[entrypoint] cupsd exited, restarting in 2s..."
+        start_ts=$SECONDS
+        /usr/sbin/cupsd -f
+        rc=$?
+        uptime=$((SECONDS - start_ts))
+
+        if [ "$uptime" -lt "$CUPSD_MIN_UPTIME" ]; then
+            fast_fails=$((fast_fails + 1))
+        else
+            fast_fails=0
+        fi
+
+        if [ "$fast_fails" -ge "$CUPSD_MAX_FAST_FAILS" ]; then
+            echo "[entrypoint] ERROR: cupsd exited ${fast_fails} times within ${CUPSD_MIN_UPTIME}s (last rc=${rc})."
+            echo "[entrypoint] ERROR: 这通常是 cupsd 配置错误（/etc/cups/cupsd.conf）或 631 端口被占用，"
+            echo "[entrypoint] ERROR: 而不是偶发崩溃。放弃自动重启，请检查上方 cupsd 日志后重启容器。"
+            break
+        fi
+
+        echo "[entrypoint] cupsd exited (rc=${rc}, uptime=${uptime}s), restarting in 2s..."
         sleep 2
-        /usr/sbin/cupsd -f &
-        CUPSD_PID=$!
     done
 ) &
 

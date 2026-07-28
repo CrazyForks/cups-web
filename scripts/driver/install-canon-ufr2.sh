@@ -51,8 +51,14 @@ case "${ARCH}" in
         CANON_UFR2_DEB_ARCH="arm64"
         ;;
     *)
-        echo "[canon-ufr2] skip: arch=${ARCH} (Canon UFR II driver has no ${ARCH} binary; supported: amd64/arm64)"
-        exit 0
+        # ── 退出码约定（全部 install-*.sh 共同遵守）───────────────────
+        #   0 = 安装成功
+        #   3 = 当前 CPU 架构不支持该驱动（厂商未提供该架构二进制）
+        #   其他非零 = 真正的失败
+        # 必须用 3 而**不是** 0：driver-install 对退出码 0 会照常写
+        # manifest.txt，Web UI 于是显示"已安装"，用户以为驱动可用。
+        echo "[canon-ufr2] unsupported arch=${ARCH} (Canon UFR II driver has no ${ARCH} binary; supported: amd64/arm64)"
+        exit 3
         ;;
 esac
 
@@ -117,4 +123,9 @@ if [ ! -f /usr/lib/cups/filter/rastertoufr2 ]; then
 fi
 
 echo "[canon-ufr2] installed Canon UFR II/UFRII LT driver v${CANON_UFR2_VERSION} (${CANON_UFR2_DEB_ARCH})"
-rm -rf /var/lib/apt/lists/*
+# 只在构建期（非 AIO）清 apt 索引省镜像体积。
+# ⚠️ 在运行中的容器里清空 /var/lib/apt/lists 会让**后续安装的其他驱动**因为
+# 没有包索引而 apt-get install 失败（"连续装两个驱动"直接翻车）。
+if [ "${CUPS_AIO:-0}" != "1" ]; then
+    rm -rf /var/lib/apt/lists/*
+fi

@@ -19,18 +19,40 @@
 
 set -eo pipefail
 
+BUILD_DEPS="build-essential gcc"
+_AIO_DEPS_INSTALLED=0
+TMPDIR_BUILD=""
+
+# ── 统一的 EXIT 清理函数 ───────────────────────────────────────────────
+# ⚠️ bash 对同一信号只保留**最后一次**注册的 handler。老实现先注册 AIO 清理，
+# 后面又 `trap 'rm -rf "${TMPDIR_BUILD}"' EXIT` 把它覆盖掉 → build-essential /
+# gcc **永不卸载** → driver-install 把整条编译工具链的文件写进 manifest 并拷进
+# .drivers，卸载驱动时按 manifest 逐个 rm，直接把 gcc/binutils/系统库删掉。
+# 所以本脚本**全局只允许一个 EXIT trap**，所有清理动作都写进这个函数。
+_cleanup() {
+    local rc=$?
+    if [ -n "${TMPDIR_BUILD}" ]; then
+        rm -rf "${TMPDIR_BUILD}"
+    fi
+    if [ "${_AIO_DEPS_INSTALLED}" = "1" ]; then
+        echo "[foo2zjs-firmware] AIO mode: cleaning up build dependencies..."
+        # shellcheck disable=SC2086 # BUILD_DEPS 是有意的空格分隔包名列表
+        apt-get purge -y --auto-remove ${BUILD_DEPS} 2>/dev/null || true
+        apt-get clean 2>/dev/null || true
+        # 注意：AIO（运行中的容器）里**不能**删 /var/lib/apt/lists——后续安装
+        # 别的驱动时 apt-get install 会因为没有索引而失败。
+    fi
+    return $rc
+}
+trap _cleanup EXIT
+
 # ── AIO 模式：自行管理编译依赖（单容器部署时 runtime 镜像不含编译工具）──
 if [ "${CUPS_AIO:-0}" = "1" ]; then
     echo "[foo2zjs-firmware] AIO mode: installing build dependencies..."
     apt-get update
-    apt-get install -y --no-install-recommends build-essential gcc
-    _CUPS_AIO_CLEANUP() {
-        echo "[foo2zjs-firmware] AIO mode: cleaning up build dependencies..."
-        apt-get purge -y --auto-remove build-essential gcc 2>/dev/null || true
-        apt-get clean 2>/dev/null || true
-        rm -rf /var/lib/apt/lists/*
-    }
-    trap '_CUPS_AIO_CLEANUP' EXIT
+    # shellcheck disable=SC2086
+    apt-get install -y --no-install-recommends ${BUILD_DEPS}
+    _AIO_DEPS_INSTALLED=1
 fi
 
 # ────────────────────────────────────────────────────────────────────
@@ -57,8 +79,9 @@ FOO2XQX_MODELS=(sihpP1005 sihpP1006 sihpP1505)
 echo "[foo2zjs-firmware] compiling arm2hpdl converter..."
 
 ARM2HPDL=""
+# 临时目录的清理由文件头部的统一 _cleanup 完成，这里**不要**再注册 EXIT trap
+# （会覆盖掉 AIO 编译依赖的卸载逻辑）。
 TMPDIR_BUILD="$(mktemp -d /tmp/foo2zjs-build.XXXXXX)"
-trap 'rm -rf "${TMPDIR_BUILD}"' EXIT
 
 wget -q "https://raw.githubusercontent.com/koenkooi/foo2zjs/master/arm2hpdl.c" \
     -O "${TMPDIR_BUILD}/arm2hpdl.c"
