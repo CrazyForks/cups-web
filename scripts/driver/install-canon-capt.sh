@@ -14,6 +14,20 @@
 
 set -eo pipefail
 
+# ── AIO 模式：自行管理编译依赖（单容器部署时 runtime 镜像不含编译工具）──
+if [ "${CUPS_AIO:-0}" = "1" ]; then
+    echo "[canon-capt] AIO mode: installing build dependencies..."
+    apt-get update
+    apt-get install -y --no-install-recommends build-essential autoconf automake libtool gcc pkg-config git
+    _CUPS_AIO_CLEANUP() {
+        echo "[canon-capt] AIO mode: cleaning up build dependencies..."
+        apt-get purge -y --auto-remove build-essential autoconf automake libtool gcc pkg-config git 2>/dev/null || true
+        apt-get clean 2>/dev/null || true
+        rm -rf /var/lib/apt/lists/*
+    }
+    trap '_CUPS_AIO_CLEANUP' EXIT
+fi
+
 # ────────────────────────────────────────────────────────────────────
 # 配置
 # ────────────────────────────────────────────────────────────────────

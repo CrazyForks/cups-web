@@ -29,6 +29,5 @@ clean:
 	rm -f $(BINARY)
 
 docker-build:
-	docker build -t cups:latest -f cups/Dockerfile cups
-	docker build --build-arg VERSION=$(VERSION) -t cups-web:latest -f Dockerfile .
+	docker build --build-arg VERSION=$(VERSION) -t cups-web:latest .
 

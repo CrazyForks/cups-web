@@ -1,4 +1,5 @@
 .etc
 .data
 .uploads
+.drivers
 ofd-converter/target/

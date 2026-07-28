@@ -35,6 +35,15 @@
               >
                 管理
               </UButton>
+              <UButton
+                :variant="route.path === '/drivers' ? 'soft' : 'ghost'"
+                :color="route.path === '/drivers' ? 'primary' : 'neutral'"
+                size="xs"
+                icon="i-lucide-puzzle"
+                @click="router.push('/drivers')"
+              >
+                驱动
+              </UButton>
             </div>
             <UButton
               v-if="session"
@@ -144,6 +153,7 @@ const menuItems = computed(() => {
   if (isAdmin.value) {
     nav.push({ label: '打印', icon: 'i-lucide-file-text', onSelect: () => router.push('/print') })
     nav.push({ label: '管理', icon: 'i-lucide-settings', onSelect: () => router.push('/admin') })
+    nav.push({ label: '驱动', icon: 'i-lucide-puzzle', onSelect: () => router.push('/drivers') })
   }
   const account = [{ label: '登出', icon: 'i-lucide-log-out', onSelect: () => logout() }]
   return nav.length ? [nav, account] : [account]

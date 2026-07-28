@@ -121,6 +121,12 @@ func main() {
 	admin.HandleFunc("/settings", adminGetSettingsHandler).Methods("GET")
 	admin.HandleFunc("/settings", adminUpdateSettingsHandler).Methods("PUT")
 	admin.HandleFunc("/cleanup", adminCleanupHandler).Methods("POST")
+	admin.HandleFunc("/drivers", adminListDriversHandler).Methods("GET")
+	admin.HandleFunc("/drivers/install", adminInstallDriverHandler).Methods("POST")
+	admin.HandleFunc("/drivers/remove", adminRemoveDriverHandler).Methods("POST")
+	admin.HandleFunc("/drivers/detect", adminDetectPrintersHandler).Methods("GET")
+	admin.HandleFunc("/drivers/upload", adminUploadDriverHandler).Methods("POST")
+	admin.HandleFunc("/drivers/setup", adminSetupPrinterHandler).Methods("POST")
 
 	// Static files (embedded) - register after API routes so /api/* is matched first
 	serverFS := server.NewEmbeddedServer(frontend.FS)

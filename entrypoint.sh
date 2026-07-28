@@ -1,5 +1,14 @@
-#!/bin/bash -ex
+#!/bin/bash
+set -e
 
+# ══════════════════════════════════════════════════════════════
+# 1. Restore persisted drivers
+# ══════════════════════════════════════════════════════════════
+/usr/local/bin/restore-drivers
+
+# ══════════════════════════════════════════════════════════════
+# 2. CUPS admin user setup (from cups/entrypoint.sh)
+# ══════════════════════════════════════════════════════════════
 if [ $(grep -ci $CUPSADMIN /etc/shadow) -eq 0 ]; then
     useradd -r -G lpadmin -M $CUPSADMIN
 
@@ -11,11 +20,17 @@ if [ $(grep -ci $CUPSADMIN /etc/shadow) -eq 0 ]; then
     dpkg-reconfigure --frontend noninteractive tzdata
 fi
 
+# ══════════════════════════════════════════════════════════════
+# 3. CUPS config restore (from cups/entrypoint.sh)
+# ══════════════════════════════════════════════════════════════
 # restore default cups config in case user does not have any
 if [ ! -f /etc/cups/cupsd.conf ]; then
     cp -rpn /etc/cups-bak/* /etc/cups/
 fi
 
+# ══════════════════════════════════════════════════════════════
+# 4. HP 1020 PPD Letter→A4 patch (from cups/entrypoint.sh)
+# ══════════════════════════════════════════════════════════════
 # ── 已添加 HP 1020 打印机的默认纸张 Letter → A4 一次性修补 ──
 # issue #48：foo2zjs 上游 HP-LaserJet_1020 PPD 的 *DefaultPageSize 是 Letter。
 # 苹果设备走 AirPrint（IPP）时按 media-default 渲染首屏纸张，Letter 默认会让
@@ -51,6 +66,9 @@ if [ -d /etc/cups/ppd ]; then
     done
 fi
 
+# ══════════════════════════════════════════════════════════════
+# 5. HP host-based firmware upload (from cups/entrypoint.sh)
+# ══════════════════════════════════════════════════════════════
 # ── HP host-based 打印机固件上传（issue #48 真正的修复点） ────────────
 # HP LaserJet 1020 / 1018 / 1005 / 1000 / P100x / P1505 等"GDI / host-based"
 # 机型每次上电都要先由主机把固件写入 /dev/usb/lpN 才能进入工作状态。物理机上
@@ -83,6 +101,9 @@ for loader_name in $HPLJ_LOADERS; do
     fi
 done
 
+# ══════════════════════════════════════════════════════════════
+# 6. Start dbus + avahi + ipp-usb (from cups/entrypoint.sh)
+# ══════════════════════════════════════════════════════════════
 # ── 后台拉起 avahi-daemon 与 ipp-usb：用于 driverless / IPP Everywhere 发现 ──
 # 其中 ipp-usb 负责把 USB 直连的 IPP Everywhere 打印机（如 Brother DCP-T425W）
 # 暴露成本地 http://localhost 的 IPP 端点，让 CUPS 能把它识别为
@@ -102,6 +123,34 @@ if command -v ipp-usb >/dev/null 2>&1; then
     (ipp-usb >/var/log/ipp-usb/ipp-usb.log 2>&1 &) || true
 fi
 
+# ══════════════════════════════════════════════════════════════
+# 7. Start cupsd in background with auto-restart watchdog
+# ══════════════════════════════════════════════════════════════
+/usr/sbin/cupsd -f &
+CUPSD_PID=$!
+
+# Watchdog: restart cupsd if it exits
+(
+    while true; do
+        wait $CUPSD_PID 2>/dev/null || true
+        echo "[entrypoint] cupsd exited, restarting in 2s..."
+        sleep 2
+        /usr/sbin/cupsd -f &
+        CUPSD_PID=$!
+    done
+) &
+
+# ══════════════════════════════════════════════════════════════
+# 8. Wait for cupsd to be ready (max 30s)
+# ══════════════════════════════════════════════════════════════
+for i in $(seq 1 30); do
+    lpstat -r >/dev/null 2>&1 && break
+    sleep 1
+done
+
+# ══════════════════════════════════════════════════════════════
+# 9. AirPrint A4 media-ready patch (from cups/entrypoint.sh)
+# ══════════════════════════════════════════════════════════════
 # ── 让 AirPrint 面板把 A4 作为已装纸(media-ready)通告(issue #82) ──────
 # issue #48 只把 PPD 的 *DefaultPageSize 改成 A4(对应 IPP media-default)，
 # 但 iPhone 原生 AirPrint 打印面板的「纸张大小」候选列表读的是 media-ready
@@ -120,10 +169,6 @@ fi
 # 用户的手动选择。任何一台失败只告警不影响其他队列与 cupsd。
 (
     set +x
-    for _ in $(seq 1 30); do
-        lpstat -r >/dev/null 2>&1 && break
-        sleep 1
-    done
     if [ -d /etc/cups/ppd ]; then
         for ppd in /etc/cups/ppd/*.ppd; do
             [ -f "$ppd" ] || continue
@@ -141,4 +186,7 @@ fi
     fi
 ) &
 
-exec /usr/sbin/cupsd -f
+# ══════════════════════════════════════════════════════════════
+# 10. Start cups-web as foreground process (PID 1)
+# ══════════════════════════════════════════════════════════════
+exec /cups-web

@@ -75,6 +75,21 @@ fi
 # ────────────────────────────────────────────────────────────────────
 # 源码编译路径（arm64 等无预编译包的架构）
 # ────────────────────────────────────────────────────────────────────
+
+# ── AIO 模式：自行管理编译依赖（单容器部署时 runtime 镜像不含编译工具）──
+if [ "${CUPS_AIO:-0}" = "1" ]; then
+    echo "[escpr2] AIO mode: installing build dependencies..."
+    apt-get update
+    apt-get install -y --no-install-recommends build-essential autoconf automake libtool gcc pkg-config libcups2-dev
+    _CUPS_AIO_CLEANUP() {
+        echo "[escpr2] AIO mode: cleaning up build dependencies..."
+        apt-get purge -y --auto-remove build-essential autoconf automake libtool gcc pkg-config libcups2-dev 2>/dev/null || true
+        apt-get clean 2>/dev/null || true
+        rm -rf /var/lib/apt/lists/*
+    }
+    trap '_CUPS_AIO_CLEANUP' EXIT
+fi
+
 echo "[escpr2] arch=${ARCH} → no prebuilt deb, building from source"
 echo "[escpr2] downloading from mirror ${ESCPR2_MIRROR_URL}"
 curl -fL --retry 3 --retry-delay 3 -o escpr2.tar.gz "${ESCPR2_MIRROR_URL}"

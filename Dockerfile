@@ -1,11 +1,22 @@
 # syntax=docker/dockerfile:1
 #
-# 顶部的 `# syntax=docker/dockerfile:1` 声明要求 BuildKit 前端——`BUILDPLATFORM`
-# 这类自动变量由 BuildKit 注入，若缺失声明，部分旧 buildx 环境会把它当成
-# 未设置，导致 `--platform=$BUILDPLATFORM` 退化成 `--platform=`（默认 target），
-# 跨架构构建时 java-builder 会重新落回 QEMU 模拟，前功尽弃。
+# Combined Dockerfile: CUPS print server + cups-web management UI
+#
+# This is an all-in-one (AIO) image that merges the standalone CUPS print server
+# (cups/Dockerfile) with the cups-web Go backend and Vue frontend into a single
+# container. The entrypoint starts cupsd in background, then launches cups-web
+# as the foreground PID-1 process.
+#
+# Build stages:
+#   1. frontend-build  — Node.js: npm ci + npm run build (Vite)
+#   2. java-builder    — OpenJDK 21 + Maven: OFD converter JAR
+#   3. builder         — Go 1.26: cups-web binary with embedded frontend
+#   4. cups-builder    — Debian: compile CUPS from OpenPrinting source
+#   5. runtime         — Debian trixie-slim: all runtime packages + compiled CUPS overlay
 
-# ---- Frontend build ----
+# ═══════════════════════════════════════════════════════════════
+# Stage 1: frontend-build
+# ═══════════════════════════════════════════════════════════════
 # 使用 node:20-slim 替代 oven/bun：Bun 官方不支持 32-bit ARM（#5060 Closed as not planned），
 # 会导致 linux/arm/v7 构建直接找不到 manifest。node:20-slim 官方镜像覆盖 amd64/arm32v7/arm64v8，
 # 而 frontend/package.json 里 scripts 全是标准 Vite/Node 命令，完全不依赖 bun 专有 API，
@@ -17,7 +28,9 @@ RUN npm ci --no-audit --no-fund --prefer-offline
 COPY frontend ./
 RUN npm run build
 
-# ---- Java OFD converter build ----
+# ═══════════════════════════════════════════════════════════════
+# Stage 2: java-builder (OFD converter)
+# ═══════════════════════════════════════════════════════════════
 #
 # 关键点：`FROM --platform=$BUILDPLATFORM ...` 把本阶段锁在 **host 本地架构**（CI 上是 amd64），
 # 不跟随 buildx 的 TARGETPLATFORM 走进 QEMU armhf 模拟。这么做的核心理由：
@@ -34,15 +47,6 @@ RUN npm run build
 # 产物 `.jar` 跨架构通吃，让 java-builder 固定跑在 amd64 上构建一次、各架构的 runtime
 # 统一 `COPY --from=java-builder` 这份纯字节码 jar，是 Docker 官方推荐的多架构 Java
 # 最佳实践，也是 `BUILDPLATFORM` 这个自动变量最典型的用法。
-#
-# 其他保留说明：
-# - 基础镜像使用 debian:trixie-slim（和 runtime 阶段统一，减少下载层）；
-# - Maven 仍用 Apache 官方 tarball（`apt install maven` 依赖 dpkg triggers 更新
-#   update-alternatives 软链，虽然 host amd64 不会触发 QEMU 坑，但 tarball 方式更自包含，
-#   跨 base 镜像升级无副作用）；
-# - 即便某天 GitHub Actions 的 runner 换成 arm64/linux，`BUILDPLATFORM` 也会自动跟随，
-#   那时 amd64 的 runtime 反而要 QEMU 模拟 java-builder——但 amd64 上的 JVM 远比 armhf 稳，
-#   在实践中是可接受的。真正要彻底脱离 QEMU，只能靠 GH Actions 的 multi-runner 矩阵拆分。
 FROM --platform=$BUILDPLATFORM debian:trixie-slim AS java-builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MAVEN_VERSION=3.9.9
@@ -70,6 +74,9 @@ RUN mvn dependency:go-offline -q
 COPY ofd-converter/src ./src
 RUN mvn clean package -q -DskipTests
 
+# ═══════════════════════════════════════════════════════════════
+# Stage 3: builder (Go binary)
+# ═══════════════════════════════════════════════════════════════
 FROM golang:1.26 AS builder
 WORKDIR /src
 
@@ -89,83 +96,155 @@ COPY . .
 COPY --from=frontend-build /src/frontend/dist ./frontend/dist
 
 # Build the Go binary (frontend must be built before this step in CI/local)
-#
-# ldflags 注入版本号的写法说明：
-#
-# 以前尝试过条件写法 `$([ -n "$VERSION" ] && echo "-X main.Version=$VERSION")`
-# 在 Docker RUN 的 shell form 下会挂——因为 Dockerfile 会先把 $VERSION 展开，
-# 导致 shell 实际看到的是四层嵌套双引号的 `-ldflags="-s -w $(... "master" ...
-# "-X main.Version=master")"`，中间那对 `"master"` 把外层 -ldflags="..."
-# 提前闭合，于是 `-X main.Version=master` 被切开，链接器只收到 `-X main.Version`，
-# 报 `flag provided but not defined: -X main.Version`。
-#
-# 修复思路：Go 对 `-X main.Version=`（空串）是合法接受的（等价于 var Version = ""，
-# 与默认值 "dev" 在显示上有区别但不会报错），所以无需条件判断，直接无条件
-# 拼 `-X main.Version=$VERSION`，让 Docker ARG 展开去把 $VERSION 变成空串或
-# 实际值，shell 里只剩一对引号，彻底避开嵌套转义。
 RUN CGO_ENABLED=0 GOOS=linux \
     go build \
       -ldflags="-s -w -X main.Version=$VERSION" \
       -o /out/cups-web ./cmd/server
 
+# ═══════════════════════════════════════════════════════════════
+# Stage 4: cups-builder (compile CUPS from OpenPrinting source)
+# ═══════════════════════════════════════════════════════════════
+# 从 OpenPrinting/cups 源码编译，覆盖安装到 /usr，然后打包成 tar 供 runtime 阶段提取。
+# cups-filters 会把 apt 版 cups 作为依赖拉进来，由它负责创建 lp/lpadmin 用户组、
+# /etc/cups 目录骨架和 systemd unit 文件等；随后用源码编译出的二进制（同样
+# --prefix=/usr）覆盖掉 apt 版的 libcups.so.2 / cupsd / cups-client 等文件，
+# 既保留 Debian 侧的集成脚手架，又替换成 OpenPrinting 上游的最新版本，且
+# libcups2 ABI 兼容让 cups-filters 和所有 printer-driver-* 可以继续工作。
+FROM debian:trixie-slim AS cups-builder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      autoconf \
+      automake \
+      libtool \
+      pkg-config \
+      libavahi-client-dev \
+      libavahi-common-dev \
+      libdbus-1-dev \
+      libgnutls28-dev \
+      libkrb5-dev \
+      libldap-dev \
+      libpam0g-dev \
+      libssl-dev \
+      libsystemd-dev \
+      libusb-1.0-0-dev \
+      zlib1g-dev \
+      wget \
+      cups-daemon \
+      cups-filters \
+      dpkg-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/build/install-cups.sh /tmp/install-cups.sh
+RUN chmod +x /tmp/install-cups.sh && bash /tmp/install-cups.sh
+# 将源码编译出的 CUPS 二进制打包成 tar，运行时阶段解包覆盖 apt 版。
+# 使用 dpkg-architecture 获取 multiarch triplet，确保 libcups*.so 路径正确。
+RUN MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+    tar cf /tmp/cups-compiled.tar \
+      /usr/sbin/cupsd \
+      /usr/bin/cups* \
+      /usr/bin/lp* \
+      /usr/bin/cancel \
+      /usr/bin/ipptool \
+      /usr/bin/ippfind \
+      /usr/lib/cups/ \
+      /usr/lib/${MULTIARCH}/libcups* \
+      /usr/share/cups/ \
+      /usr/share/doc/cups/ \
+      2>/dev/null || true
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 5: runtime (all-in-one)
+# ═══════════════════════════════════════════════════════════════
 FROM debian:trixie-slim AS runtime
 
-# Install LibreOffice (headless conversion), Ghostscript, and minimal fonts/certificates
-#
-# === 中文字体在容器里的三层兜底（从"精准"到"保底"） =============================
-#
-# 第 1 层（最精准）——cidfmap.local：
-#   针对 Acrobat/WPS 导出的"空壳 Type0 + UniGB-UCS2-H + GBK 字节 BaseFont"这类 PDF
-#   （/BaseFont /#ba#da#cc#e5 即"黑体"的 GBK 字节，准考证/国标表格最常见），由我们在
-#   下面的 RUN 里手动写入 /etc/ghostscript/cidfmap.local，把 8 个 GBK 字节名显式映射到
-#   本镜像自带的真实 TrueType 字体（宋/黑/楷/仿宋 × Regular/Bold 各 1 条共 8 条）。
-#
-#   因为 arphic-uming / arphic-ukai / wqy-zenhei 都是**单字重 TrueType**（没有配套的
-#   Bold 文件），gs pdfwrite 在重建字体字典时也不会做 synthetic bold——它只会照抄
-#   `,Bold` 后缀进新字体名，实际字形仍是 Regular。因此我们用"换字体制造视觉粗细差"
-#   的策略：
-#     宋体 Regular → AR PL UMing CN（衬线细）     宋体 Bold → WenQuanYi Zen Hei（无衬线粗）
-#     黑体 Regular → WenQuanYi Zen Hei            黑体 Bold → WenQuanYi Zen Hei（同文件，视觉差小，已是最粗可用字体）
-#     楷体 Regular → AR PL UKai CN（楷体手写）    楷体 Bold → AR PL UKai CN（同上）
-#     仿宋 Regular → AR PL UMing CN（明朝兜底）   仿宋 Bold → WenQuanYi Zen Hei（制造粗细差）
-#   这样纸面上至少能看出"标题比正文粗"的视觉层级，而不是全部糊成单一字重。楷体 Bold
-#   受限于 arphic/wqy 字库没有对应字体，视觉上仍与 Regular 相同，这是字库本身的限制。
-#
-#   之所以只选纯 TrueType 字体（arphic/wqy）而非 Noto CJK，是因为 Ghostscript 10.x
-#   对 CFF-based OpenType Collection（如 Noto CJK OTC）在 CIDFont 子字体索引上偶有坑，
-#   TrueType TTC 最稳。
-#
-# 第 2 层——fonts-droid-fallback（兜底 CID 字体）：
-#   cidfmap.local 没覆盖到的 GBK/GB1 字体名（例如个别厂商自造字体名），gs 会回落到
-#   Resource/CIDFSubst/DroidSansFallback.ttf 这个按 Adobe-GB1 CID 编号组织的字体，
-#   与 UniGB-UCS2-H 推导的 CID 对齐。Debian 把这个字体拆成独立的 fonts-droid-fallback
-#   包（ghostscript 主包里的路径是指向它的软链接），缺包就会出现中文变"豆腐块"
-#   （macOS brew 的 ghostscript 自带该字体，本地测试不会踩到；Docker 里才会）。
-#
-# 第 3 层——fonts-noto-cjk / fonts-arphic-* / fonts-wqy-zenhei（Unicode 字形库）：
-#   给 LibreOffice headless 渲染 Office 文档时用；按 Unicode 组织、不按 CID，因此
-#   不能替代第 1/2 层在 gs CIDFSubst 路径的角色。
-#
-# === cidfmap.local 的加载路径（重要） ============================================
-# 我们把文件写到 /etc/ghostscript/cidfmap.local，并在构建阶段将其复制为
-# gs Resource/Init/cidfmap，trixie 的 gs 10.05.1 默认不存在该文件，
-# 直接创建后 gs 启动时自动加载，无需任何额外命令行参数。
-#
-# === 诊断命令 =====================================================================
-#   gs -dPDFDEBUG \
-#      -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -sOutputFile=/tmp/out.pdf <in.pdf> 2>&1 \
-#      | grep -E "Substituting|CIDFSubst|Loading CIDFont"
-#   - 命中 cidfmap.local 时日志出现：Substituting font <宋体> from /usr/share/fonts/...
-#   - 未命中 cidfmap.local、走第 2 层兜底时出现：substitute from .../DroidSansFallback.ttf
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress openjdk-21-jre \
-    ghostscript fonts-droid-fallback \
-    fonts-dejavu-core fonts-noto-cjk fonts-arphic-uming fonts-arphic-ukai fonts-wqy-zenhei \
-    fonts-wqy-microhei \
-    fonts-liberation2 fonts-urw-base35 gsfonts fontconfig \
-    ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+ENV CUPSADMIN=print
+ENV CUPSPASSWORD=print
 
+# ────────────────────────────────────────────────────────────────
+# apt: CUPS runtime + printer drivers + cups-web dependencies
+# ────────────────────────────────────────────────────────────────
+# CUPS 打印生态包（from cups/Dockerfile）+ cups-web 运行时依赖（LibreOffice, GS, fonts）
+# 合并到单个 apt-get install 减少层数。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      # ── CUPS 打印生态（cups-filters 会拉入 apt 版 cups 作为依赖） ──
+      cups-filters \
+      cups-client \
+      cups-daemon \
+      cups-ipp-utils \
+      printer-driver-all \
+      printer-driver-cups-pdf \
+      printer-driver-escpr \
+      printer-driver-foo2zjs \
+      printer-driver-splix \
+      printer-driver-postscript-hp \
+      printer-driver-hpijs \
+      foomatic-db-engine \
+      cups-browsed \
+      ipp-usb \
+      printer-driver-brlaser \
+      foomatic-db-compressed-ppds \
+      openprinting-ppds \
+      hpijs-ppds \
+      hp-ppd \
+      hplip \
+      avahi-daemon \
+      dbus \
+      # ── 通用工具（驱动安装脚本需要） ──
+      curl \
+      wget \
+      unzip \
+      rsync \
+      ca-certificates \
+      # ── LibreOffice headless（Office 文档转换） ──
+      libreoffice-core \
+      libreoffice-writer \
+      libreoffice-calc \
+      libreoffice-impress \
+      # ── Java 运行时（OFD converter） ──
+      openjdk-21-jre \
+      # ── Ghostscript（PDF 处理） ──
+      ghostscript \
+      # ── 字体：CJK 中文 ──
+      fonts-droid-fallback \
+      fonts-noto-cjk \
+      fonts-arphic-uming \
+      fonts-arphic-ukai \
+      fonts-wqy-zenhei \
+      fonts-wqy-microhei \
+      # ── 字体：西文基础 ──
+      fonts-dejavu-core \
+      fonts-liberation2 \
+      fonts-urw-base35 \
+      gsfonts \
+      fontconfig \
+    && fc-cache -f \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ────────────────────────────────────────────────────────────────
+# Overlay: 用源码编译的 CUPS 二进制覆盖 apt 版
+# ────────────────────────────────────────────────────────────────
+# apt 版 cups-daemon 已创建好 lp/lpadmin 用户组、/etc/cups 目录骨架等，
+# 这里只用源码编译版的二进制和库文件覆盖，获得 OpenPrinting 上游最新版本。
+COPY --from=cups-builder /tmp/cups-compiled.tar /tmp/
+RUN tar xf /tmp/cups-compiled.tar -C / && rm /tmp/cups-compiled.tar && ldconfig
+
+# ────────────────────────────────────────────────────────────────
+# CUPS configuration: 放开监听 + 浏览，备份默认配置供 entrypoint 还原
+# ────────────────────────────────────────────────────────────────
+RUN sed -i 's/Listen localhost:631/Listen 0.0.0.0:631/' /etc/cups/cupsd.conf && \
+    sed -i 's/Browsing Off/Browsing On/' /etc/cups/cupsd.conf && \
+    sed -i 's/<Location \/>/<Location \/>\n  Allow All/' /etc/cups/cupsd.conf && \
+    sed -i 's/<Location \/admin>/<Location \/admin>\n  Allow All\n  Require user @SYSTEM/' /etc/cups/cupsd.conf && \
+    sed -i 's/<Location \/admin\/conf>/<Location \/admin\/conf>\n  Allow All/' /etc/cups/cupsd.conf && \
+    echo "ServerAlias *" >> /etc/cups/cupsd.conf && \
+    echo "DefaultEncryption Never" >> /etc/cups/cupsd.conf
+RUN cp -rp /etc/cups /etc/cups-bak
+
+# ────────────────────────────────────────────────────────────────
+# Custom fonts: docker-fonts/ 目录中的用户字体
+# ────────────────────────────────────────────────────────────────
 # 自定义字体：用户可将 SimSun/SimHei 等 Windows 字体放入 docker-fonts/ 目录，
 # 构建时自动安装到镜像中，以获得更接近原始 PDF 的字体渲染效果。
 # 如果 docker-fonts/ 目录为空（只有 README.md），此步骤不会报错。
@@ -181,21 +260,17 @@ RUN mkdir -p /usr/share/fonts/truetype/custom && \
 RUN cp /tmp/docker-fonts/fontconfig-chinese.conf /etc/fonts/conf.d/05-custom-chinese-fonts.conf 2>/dev/null || true
 RUN fc-cache -f 2>/dev/null || true
 
-# 安装 Ghostscript cidfmap.local（从 docker-fonts/cidfmap.local 复制）
-#
-# 语法参考：/usr/share/ghostscript/*/Resource/Init/cidfmap（gs 官方示例）
-# 用 /#xx 十六进制 name 转义表示 GBK 字节：
-#   宋体 = CB CE CC E5  →  /#cb#ce#cc#e5
-#   黑体 = BA DA CC E5  →  /#ba#da#cc#e5
-#   楷体 = BF AC CC E5  →  /#bf#ac#cc#e5
-#   仿宋 = B7 C2 CB CE  →  /#b7#c2#cb#ce
-# CSI 固定为 [(GB1) 2] = Adobe-GB1-2，覆盖 GB2312/GBK 常用汉字。
+# ────────────────────────────────────────────────────────────────
+# Ghostscript cidfmap.local: GBK 字体名映射
+# ────────────────────────────────────────────────────────────────
+# 针对 Acrobat/WPS 导出的"空壳 Type0 + UniGB-UCS2-H + GBK 字节 BaseFont"这类 PDF
+# （/BaseFont /#ba#da#cc#e5 即"黑体"的 GBK 字节，准考证/国标表格最常见），由我们
+# 手动写入 /etc/ghostscript/cidfmap.local，把 8 个 GBK 字节名显式映射到本镜像自带
+# 的真实 TrueType 字体。
 RUN mkdir -p /etc/ghostscript && \
     cp /tmp/docker-fonts/cidfmap.local /etc/ghostscript/cidfmap.local && \
     rm -rf /tmp/docker-fonts
-# 构建期自检：确保文件写入成功、条目数对得上。不在构建期用 gs 解析这个文件，因为
-# `.runlibfile` 必须配合 `-I` 才能工作，而且 gs 加载资源要占用额外的子进程空间，
-# 运行时首次 gs 调用会做真正的解析验证，构建期只做结构性检查。
+# 构建期自检：确保文件写入成功、条目数对得上。
 RUN test -s /etc/ghostscript/cidfmap.local \
   && echo "[dockerfile] cidfmap.local size: $(wc -c < /etc/ghostscript/cidfmap.local) bytes" \
   && entries=$(grep -cE '^/#' /etc/ghostscript/cidfmap.local) \
@@ -204,8 +279,6 @@ RUN test -s /etc/ghostscript/cidfmap.local \
 
 # 如果用户提供了 SimSun/SimHei/SimKai/SimFang 字体，更新 cidfmap.local 映射，
 # 用真实 Windows 字体替换 arphic/wqy 的 fallback 映射，获得更精确的渲染效果。
-# 注意：宋体(Regular+Bold)和仿宋(Regular+Bold)的基准路径都是 uming.ttc，
-# simsun.ttf 先做全局替换，simfang.ttf 再通过行匹配 /^#b7#c2#cb#ce/ 精确覆盖仿宋行。
 RUN if [ -f /usr/share/fonts/truetype/custom/simsun.ttf ]; then \
       sed -i 's|/usr/share/fonts/truetype/arphic/uming.ttc) /SubfontID 0|/usr/share/fonts/truetype/custom/simsun.ttf) /SubfontID 0|g' /etc/ghostscript/cidfmap.local; \
       echo "[dockerfile] cidfmap: simsun.ttf mapped (宋体 Regular+Bold, 仿宋 pending)"; \
@@ -233,23 +306,34 @@ RUN GS_INIT_DIR=$(find /usr/share/ghostscript -path "*/Resource/Init" -type d | 
         echo "[dockerfile] cidfmap.local -> $GS_INIT_DIR/cidfmap"; \
     fi
 
-# Create a non-root user for running the service
-RUN groupadd -r nonroot && useradd -r -g nonroot nonroot
+# ────────────────────────────────────────────────────────────────
+# Driver management: install scripts + management commands
+# ────────────────────────────────────────────────────────────────
+# Copy driver install scripts (NOT executed at build time — users install on demand)
+COPY scripts/driver/install-*.sh /opt/cups-drivers/scripts/
+# Copy driver management commands
+COPY scripts/driver/driver-install.sh /usr/local/bin/driver-install
+COPY scripts/driver/driver-list.sh /usr/local/bin/driver-list
+COPY scripts/driver/driver-remove.sh /usr/local/bin/driver-remove
+COPY scripts/driver/restore-drivers.sh /usr/local/bin/restore-drivers
+RUN chmod +x /usr/local/bin/driver-* /usr/local/bin/restore-drivers /opt/cups-drivers/scripts/*.sh
 
-RUN mkdir -p \
-    /home/nonroot/.cache/dconf \
-    /home/nonroot/.config/libreoffice \
-    /home/nonroot/.local/share/libreoffice \
-  && chown -R nonroot:nonroot /home/nonroot/ \
-  && chmod -R 755 /home/nonroot/ \
-  && chmod 700 /home/nonroot/.cache/dconf
+# Create base snapshot for driver diff (used by driver-list to detect installed drivers)
+RUN mkdir -p /opt/cups-base && \
+    find /usr/lib/cups /usr/share/cups /usr/share/ppd /lib/firmware \
+      -type f 2>/dev/null | sort > /opt/cups-base/filelist.txt
 
-ENV DCONF_USER_CONFIG_DIR=/home/nonroot/.config/dconf
-ENV HOME=/home/nonroot
-ENV XDG_CACHE_HOME=/home/nonroot/.cache
-
+# ────────────────────────────────────────────────────────────────
+# Copy application binaries from build stages
+# ────────────────────────────────────────────────────────────────
 COPY --from=builder /out/cups-web /cups-web
 COPY --from=java-builder /src/ofd-converter/target/ofd-converter.jar /ofd-converter.jar
-EXPOSE 8080
-USER nonroot
-ENTRYPOINT ["/cups-web"]
+
+# ────────────────────────────────────────────────────────────────
+# Entrypoint
+# ────────────────────────────────────────────────────────────────
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 631 8080
+ENTRYPOINT ["/entrypoint.sh"]

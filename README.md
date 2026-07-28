@@ -51,35 +51,62 @@
 - **打印选项**：份数、单双面、彩色/黑白、纸张大小、纸张类型、页面方向、页码范围、缩放、镜像打印
 - **实时预览**：支持 PDF 预览、纸张方向的可视化预览、页数估算
 
-### 内置打印机驱动
+### 打印机驱动
 
-`hanxi/cups` 镜像出厂即预装了一批常见品牌的打印机驱动，免去用户在容器里手动 `apt install` 或翻官网下载 `.deb` 的麻烦。除非另行说明，下面列出的驱动都同时覆盖 `linux/amd64` + `linux/arm64` + `linux/arm/v7`（少数厂商无 ARM 二进制的会标注）。
+镜像内预装了 Debian `printer-driver-all` 等通用驱动包，覆盖大部分常见打印机。对于特定品牌打印机，提供**按需手动安装**的驱动脚本和 Web 管理界面：
 
-**通用驱动包**（apt 安装）：
+**预装通用驱动**（开箱即用）：
 
-- `printer-driver-all`：Debian 维护的驱动 meta 包，包含 splix、c2050、m2300w、ptouch 等数十种小众驱动
-- `printer-driver-cups-pdf`：虚拟 PDF 打印机，无实体打印机也可调试
-- `printer-driver-escpr`：Epson ESC/P-R 标准款（覆盖大部分 Epson 喷墨老机型）
-- `printer-driver-foo2zjs`：ZjStream / Hiperc / OAKT 协议机型（部分 HP / Konica / Minolta 老款激光机）
-- `printer-driver-brlaser`：Brother 老款激光机（HL-L2300D、HL-1110、DCP-7055 等，[issue #32](https://github.com/hanxi/cups-web/issues/32)）
-- `printer-driver-gutenprint`：覆盖 Epson / Canon / HP / Lexmark 等大量老机型；**仅 amd64 / arm64**（trixie armhf 上游未提供 binary）
-- `foomatic-db-compressed-ppds` + `openprinting-ppds`：Foomatic / OpenPrinting 海量 PPD 库
-- `hplip` + `hpijs-ppds` + `hp-ppd`：HP 全系打印/扫描套件（LaserJet、OfficeJet、DeskJet、Envy 等）
-- `ipp-usb` + CUPS 内置 driverless 模型：把 USB 直连的 IPP Everywhere / AirPrint / Mopria 打印机自动识别为网络打印机（新款 Brother DCP-T425W、HP Tango、Canon PIXMA TS 系列等大多走这条路）
+- `printer-driver-all`：Debian 维护的驱动 meta 包，包含 splix、c2050、m2300w、ptouch 等
+- `printer-driver-cups-pdf`：虚拟 PDF 打印机
+- `printer-driver-escpr`：Epson ESC/P-R 标准款（大部分 Epson 喷墨老机型）
+- `printer-driver-foo2zjs`：ZjStream / Hiperc / OAKT 协议（部分 HP / Konica / Minolta 老款激光机）
+- `printer-driver-brlaser`：Brother 老款激光机
+- `foomatic-db-compressed-ppds` + `openprinting-ppds`：海量 PPD 库
+- `hplip` + `hpijs-ppds` + `hp-ppd`：HP 全系打印套件
+- `ipp-usb` + CUPS 内置 driverless：IPP Everywhere / AirPrint / Mopria 自动识别
 
-**厂商专有驱动**（脚本另行下载/编译）：
+**可选厂商驱动**（通过 Web 界面或命令行按需安装，安装后自动持久化）：
 
-| 驱动 | 版本 | 架构覆盖 | 适用机型 |
+| 驱动 | 命令名 | 架构 | 适用机型 |
 | --- | --- | --- | --- |
-| Epson ESC/P-R 2（源码编译） | 1.2.39 | amd64 / arm64 / armv7 | 新款 Epson 喷墨：ET-18100、L8050、L8160、WF-7840 等（含无边距打印，[issue #30](https://github.com/hanxi/cups-web/issues/30)） |
-| Epson 国行专有驱动（`epson-inkjet-printer-201601w` + `epson-printer-utility`） | 1.0.1 / 1.2.2 | **仅 amd64** | Epson 中国区早期机型 L380、L455 等（原厂墨水检测/尺寸预设更完整） |
-| Canon UFR II / UFRII LT 官方驱动（`cnrdrvcups-ufr2-uk`） | 6.30-1.07 | amd64 / arm64 | i-SENSYS LBP/MF、imageCLASS、imageRUNNER (iR)、imagePRESS (iPR) 等所有走 UFR II / UFRII LT 协议的 Canon 激光机（[issue #34](https://github.com/hanxi/cups-web/issues/34)） |
-| 柯尼卡美能达 bizhub 3000MF 黑白激光驱动（`bizhub3000mfpdrvchn`） | 1.0.0-1 | amd64 / arm64 | Konica Minolta bizhub 3000MF 多功能一体机（[issue #35](https://github.com/hanxi/cups-web/issues/35)） |
-| HP LaserJet 1020 / 1020 Plus 固件 + A4-default PPD | sihp1020.dl | 全架构 | HP 1020 系列 host-based 打印机：自动下载固件 `sihp1020.dl` 到 foo2zjs 路径，并派生一份默认 A4 纸张的 PPD（[issue #40](https://github.com/hanxi/cups-web/issues/40)、[issue #48](https://github.com/hanxi/cups-web/issues/48)） |
+| Canon UFR II | `canon-ufr2` | amd64 / arm64 | i-SENSYS LBP/MF、imageCLASS、imageRUNNER 等 |
+| Canon CAPT | `canon-capt` | 全架构 🔧 | LBP2900 / LBP2900B |
+| HP LaserJet 1020 固件 | `hp-laserjet1020` | 全架构 | HP LaserJet 1020 / 1020 Plus |
+| HP foo2zjs 固件 | `foo2zjs-firmware` | 全架构 🔧 | HP LaserJet 1000/1005/1018/P1005/P1006/P1505 |
+| Epson ESC/P-R 2 | `escpr2` | amd64 / armhf / arm64 | ET-18100, L8050, L8160, WF-7840 等 |
+| Epson 国行驱动 | `epson-cn` | 仅 amd64 | L380, L455 等国行机型 |
+| Konica Minolta bizhub | `konica-bizhub` | amd64 / arm64 | bizhub 3000MF |
+| Sharp PostScript | `sharp` | 全架构 | MX-C2622R 等 PostScript 打印机 |
+| Gutenprint | `gutenprint` | amd64 / arm64 | 大量 Epson/Canon/HP 老机型 |
 
-> 💡 表中标注为「仅 amd64」或「amd64 / arm64」的驱动，在未覆盖的架构（如树莓派 armv7）上会被脚本静默 `skip`，不影响其他驱动的使用。如果你的打印机不在以上列表中，仍可访问 CUPS 管理界面（<http://localhost:631>）通过自带的 PPD 库或上传自定义 PPD 添加。
->
-> 📱 **苹果 AirPrint 选不到 A4 纸**（issue #48）：foo2zjs 上游 HP 1020 PPD 的默认纸张是 Letter，iPhone 通过 AirPrint 连接时按 `media-default` 渲染首屏，A4 会被折叠/隐藏。容器启动时 `entrypoint.sh` 会自动把已添加的 HP 1020 打印机 PPD 默认纸张从 Letter 切到 A4（备份保留为 `*.bak-cupsweb-issue48`）；新加打印机时也可以直接选 CUPS 列表里的 `HP LaserJet 1020 Foomatic/foo2zjs-z1 A4 (cups-web)` 变体。
+> 🔧 = 需要编译，安装时间较长（几分钟）。其他驱动秒级安装。
+
+### 驱动管理（Web 界面）
+
+管理员可通过 Web 界面（「驱动」页面）进行驱动管理：
+
+- **自动检测**：扫描 USB / 网络打印机，自动匹配推荐驱动
+- **一键安装**：检测到打印机后一键安装驱动并自动添加到 CUPS
+- **驱动列表**：查看所有可用驱动的安装状态，一键安装/卸载
+- **上传自定义驱动**：支持上传 PPD 文件或 Debian 包
+- **驱动持久化**：安装的驱动自动保存到持久卷，容器重建后自动恢复
+
+也可以通过命令行安装驱动：
+
+```bash
+# 查看可用驱动
+docker exec cups driver-list
+
+# 安装驱动
+docker exec cups driver-install canon-ufr2
+
+# 查看已安装驱动
+docker exec cups driver-list --installed
+
+# 卸载驱动
+docker exec cups driver-remove canon-ufr2
+```
 
 ### 用户与权限
 
@@ -105,7 +132,7 @@
 - **打印协议**：[OpenPrinting/goipp](https://github.com/OpenPrinting/goipp)（IPP）
 - **前端**：Vue 3 · Vite 7 · [Nuxt UI v4](https://ui.nuxt.com/) · Tailwind CSS v4 · Vue Router（hash 模式）
 - **文档转换**：LibreOffice（Office → PDF）· [ofdrw](https://github.com/ofdrw/ofdrw)（OFD → PDF，Java 17）
-- **打印服务**：[CUPS](https://www.cups.org/)
+- **打印服务**：[CUPS](https://www.cups.org/)（源码编译 2.4.x，覆盖 apt 版本）
 
 ## 🚀 快速开始
 
@@ -128,40 +155,27 @@
 ```yaml
 services:
   cups:
-    image: hanxi/cups:latest
+    image: hanxi/cups-web:latest
+    container_name: cups
     user: root
     security_opt:
       - apparmor:unconfined
     environment:
-      - CUPSADMIN=${CUPSADMIN}
-      - CUPSPASSWORD=${CUPSPASSWORD}
+      - CUPSADMIN=${CUPSADMIN:-print}
+      - CUPSPASSWORD=${CUPSPASSWORD:-print}
+      - TZ=${TZ:-Asia/Shanghai}
     ports:
       - "631:631"
-    # USB 打印机热插拔支持（issue #81）：用 volume 目录挂载 /dev/bus/usb
-    # 而非 devices:，让「后开机」的打印机新建的设备节点能实时传播进容器；
-    # device_cgroup_rules 放开 USB 字符设备（major 189）的访问权限。
+      - "1180:8080"
     volumes:
       - ./.etc:/etc/cups
+      - ./.data:/data
+      - ./.uploads:/uploads
+      - ./.drivers:/opt/cups-drivers/data
       - /dev/bus/usb:/dev/bus/usb
       - /run/udev:/run/udev:ro
     device_cgroup_rules:
       - 'c 189:* rmw'
-    restart: unless-stopped
-
-  web:
-    image: hanxi/cups-web:latest
-    user: root
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - CUPS_HOST=cups:631
-    volumes:
-      - ./.data:/data
-      - ./.uploads:/uploads
-    ports:
-      - "1180:8080"
-    depends_on:
-      - cups
     restart: unless-stopped
 ```
 
@@ -171,28 +185,44 @@ services:
 wget https://raw.githubusercontent.com/hanxi/cups-web/master/docker-compose.yml
 ```
 
-### 2. 配置环境变量
+### 2. 配置环境变量（可选）
 
 在同目录创建 `.env`：
 
 ```bash
-CUPSADMIN=admin
+CUPSADMIN=print
 CUPSPASSWORD=your_cups_password
+TZ=Asia/Shanghai
 ```
 
 ### 3. 启动服务
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-### 4. 配置打印机
+### 4. 安装打印机驱动（按需）
 
-访问 CUPS 管理界面：<http://localhost:631>，使用 `.env` 中的账号登录并添加打印机。
+通过 Web 界面安装（推荐）：
+1. 访问 <http://localhost:1180>，使用 `admin/admin` 登录
+2. 点击导航栏「驱动」进入驱动管理页面
+3. 点击「扫描打印机」自动检测已连接的打印机
+4. 对检测到的打印机点击「一键安装并添加」
+
+或通过命令行安装：
+```bash
+docker exec cups driver-install canon-ufr2
+```
+
+### 5. 配置打印机
+
+如果没有通过上面的自动检测添加打印机，也可以手动配置：
+
+访问 CUPS 管理界面：<http://localhost:631>，使用 CUPS 管理员账号登录并添加打印机。
 
 > ⚠️ **重要**：添加打印机后，必须在 CUPS 管理后台将其设为 **Shared（共享）** 状态，否则 Web 端无法发现该打印机。
 
-### 5. 访问 Web
+### 6. 访问 Web
 
 浏览器打开 <http://localhost:1180>，使用默认账号登录：
 
@@ -260,7 +290,10 @@ export LISTEN_ADDR=:8080
 | `LISTEN_ADDR` | Web 服务监听地址 | `:8080` |
 | `DB_PATH` | SQLite 数据库路径 | `data/cups-web.db` |
 | `UPLOAD_DIR` | 上传文件目录 | `uploads` |
-| `CUPS_HOST` | CUPS 服务地址（`host` 或 `host:port`） | `localhost` |
+| `CUPS_HOST` | CUPS 服务地址（Docker 内默认 `localhost`） | `localhost` |
+| `CUPSADMIN` | CUPS 管理员用户名 | `print` |
+| `CUPSPASSWORD` | CUPS 管理员密码 | `print` |
+| `TZ` | 时区 | `Asia/Shanghai` |
 
 ### 命令行参数
 
@@ -268,25 +301,21 @@ export LISTEN_ADDR=:8080
 | --- | --- |
 | `-addr` | 监听地址，优先级高于 `LISTEN_ADDR` |
 
-### CUPS 容器环境变量
-
-| 变量名 | 说明 |
-| --- | --- |
-| `CUPSADMIN` | CUPS 管理员用户名（**必填**） |
-| `CUPSPASSWORD` | CUPS 管理员密码（**必填**） |
-
 ### 默认端口
 
-- CUPS：`631`
+- CUPS：`631`（管理界面 + IPP 协议）
 - Web：容器内 `8080`，`docker-compose.yml` 默认映射到宿主机 `1180`
 
 ### 数据持久化目录
 
 Docker 默认卷映射：
 
-- `./.data` → 数据库
-- `./.uploads` → 上传的原始文件与转换后 PDF
-- `./.etc` → CUPS 配置
+| 宿主机路径 | 容器路径 | 说明 |
+| --- | --- | --- |
+| `./.etc` | `/etc/cups` | CUPS 配置（打印机、PPD 等） |
+| `./.data` | `/data` | cups-web 数据库 |
+| `./.uploads` | `/uploads` | 上传的原始文件与转换后 PDF |
+| `./.drivers` | `/opt/cups-drivers/data` | 手动安装的打印机驱动（持久化） |
 
 ---
 
@@ -314,6 +343,7 @@ Docker 默认卷映射：
 - **用户管理**：创建、编辑、删除；默认 `admin` 账号不可删除、不可改名、角色固定
 - **打印记录**：查看全站记录，按用户名/日期过滤，下载原始文件
 - **系统设置**：数据保留天数（`0` 表示永久保留）
+- **驱动管理**：自动检测打印机、安装/卸载驱动、上传自定义 PPD/deb
 
 ---
 
@@ -347,9 +377,10 @@ server {
 
 ```yaml
 services:
-  web:
+  cups:
     ports:
-      - "你的端口:8080"
+      - "你的CUPS端口:631"
+      - "你的Web端口:8080"
 ```
 
 ### 数据备份
@@ -358,6 +389,7 @@ services:
 cp ./.data/cups-web.db /backup/location/
 tar -czf uploads-backup.tar.gz ./.uploads/
 tar -czf cups-config-backup.tar.gz ./.etc/
+tar -czf drivers-backup.tar.gz ./.drivers/
 ```
 
 ---
@@ -369,58 +401,45 @@ tar -czf cups-config-backup.tar.gz ./.etc/
 删除数据库文件后重启即可重置为默认 `admin/admin`（**会丢失全部数据**）：
 
 ```bash
-docker-compose down
+docker compose down
 rm ./.data/cups-web.db
-docker-compose up -d
+docker compose up -d
 ```
 
 ### Web 端看不到打印机？
 
 1. 检查打印机是否在 CUPS 中正常列出（<http://localhost:631>）
 2. 确认打印机设置为 **Shared**
-3. 容器化部署时确认 `CUPS_HOST` 指向正确的 CUPS 服务地址
-4. 重启 CUPS：`docker-compose restart cups`
+3. 重启容器：`docker compose restart cups`
 
-### 打印机后开机就识别不到，要重启容器才行？（USB 热插拔）
+### 打印机后开机就识别不到？（USB 热插拔）
 
-打印机比容器晚开机时,CUPS 枚举不到 USB 设备——典型场景是 NAS 长期开机、用时才开打印机（issue #81）。原因是旧版 `docker-compose.yml` 用 `devices:` 绑定 USB,而 `devices:` 只在容器启动那一刻绑定一次,「后开机」打印机新建的 `/dev/bus/usb/...` 节点不会传播进容器。
+使用最新的 `docker-compose.yml`（volume 目录挂载 `/dev/bus/usb` + `device_cgroup_rules`）即可支持热插拔。若你的 Docker 环境不支持 `device_cgroup_rules`，改用 `privileged: true` 即可。
 
-按上方最新的 `docker-compose.yml` 改用 volume 目录挂载 `/dev/bus/usb` + `device_cgroup_rules` 即可支持热插拔:
+### 安装的驱动丢失了？
 
-```bash
-docker-compose down && docker-compose up -d
+确认 `docker-compose.yml` 中已配置驱动持久化卷：
+```yaml
+volumes:
+  - ./.drivers:/opt/cups-drivers/data
 ```
 
-之后先启动容器、再开打印机也能被识别。若你的 Docker 环境不支持 `device_cgroup_rules`（部分旧版本 / rootless / cgroup v1）,删掉该字段并改用 `privileged: true` 即可,效果相同、权限更宽。
+驱动数据保存在 `.drivers` 目录中，容器重建后自动恢复。
 
-### 在 PVE (Proxmox VE) LXC 容器中部署时，打印或文件转换失败？（AppArmor DENIED）
+### 在 PVE LXC 容器中部署时失败？（AppArmor DENIED）
 
-从 **PVE 7.0** 及以上版本（如 PVE 7.x / 8.x，基于 Linux 内核 5.11+ / 6.x）开始，PVE 在 LXC 嵌套 Docker 环境下启用了更严格的 AppArmor 限制。系统的 Docker 默认 AppArmor 配置文件 (`docker-default`) 会拦截容器内的 Unix Socket 创建与进程间通信，表现为 dmesg / audit 日志中出现类似 `apparmor="DENIED" operation="create" profile="docker-default" comm="jobs.cgi" family="unix"` 的报错，导致 CUPS 的 `jobs.cgi` 无法提交打印或 Web 端 LibreOffice / OFD 转换服务无法正常运行。
-
-**解决方法**：
-
-1. 按照最新版 `docker-compose.yml`，在 `cups` 与 `web` 服务中添加 `security_opt`:
-   ```yaml
-   security_opt:
-     - apparmor:unconfined
-   ```
-2. 如果是在 **PVE LXC 容器**内运行 Docker，请确保在 PVE 后台放开了 LXC 的嵌套容器权限（PVE 网页控制台 → LXC 容器 → Options → Features → 勾选 `Nesting` 和 `Keyctl`，或在 `/etc/pve/lxc/<ID>.conf` 中配置 `features: nesting=1,keyctl=1`）。
+在服务中添加 `security_opt: [apparmor:unconfined]`（最新 `docker-compose.yml` 已包含）。PVE LXC 容器还需开启 `Nesting` 和 `Keyctl` 功能。
 
 ### Office / OFD 转换失败？
 
 - 转换有 **60 秒超时**，复杂文档可能超时
 - 确认文档本身未损坏；可尝试本地先另存为 PDF 再上传
-- 查看日志：`docker-compose logs -f web`
-
-### 上传文件一直堆积占空间？
-
-在「管理后台 → 系统设置」中设置「数据保留天数」为大于 0 的值，维护任务每小时巡检一次，自动清理过期记录与文件。
+- 查看日志：`docker compose logs -f cups`
 
 ### 如何查看日志？
 
 ```bash
-docker-compose logs -f web
-docker-compose logs -f cups
+docker compose logs -f cups
 ```
 
 ---

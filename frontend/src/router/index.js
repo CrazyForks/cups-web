@@ -7,7 +7,13 @@ const routes = [
   { path: '/', redirect: '/login' },
   { path: '/login', name: 'login', component: LoginView, meta: { requiresAuth: false } },
   { path: '/print', name: 'print', component: PrintView, meta: { requiresAuth: true } },
-  { path: '/admin', name: 'admin', component: AdminView, meta: { requiresAuth: true, requiresAdmin: true } }
+  { path: '/admin', name: 'admin', component: AdminView, meta: { requiresAuth: true, requiresAdmin: true } },
+  {
+    path: '/drivers',
+    name: 'drivers',
+    component: () => import('../views/DriversView.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true }
+  }
 ]
 
 const router = createRouter({
