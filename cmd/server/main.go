@@ -127,6 +127,10 @@ func main() {
 	admin.HandleFunc("/drivers/detect", adminDetectPrintersHandler).Methods("GET")
 	admin.HandleFunc("/drivers/upload", adminUploadDriverHandler).Methods("POST")
 	admin.HandleFunc("/drivers/setup", adminSetupPrinterHandler).Methods("POST")
+	// 驱动安装/卸载/一键设置改为异步任务（编译型驱动几分钟，会被全局
+	// WriteTimeout=120s 掐断），这里提供任务状态与增量日志的轮询入口。
+	// jobId 是 randomToken() 生成的不透明大写 base32 串，故约束放宽到字母数字。
+	admin.HandleFunc("/drivers/jobs/{id:[A-Za-z0-9]+}", adminDriverJobHandler).Methods("GET")
 
 	// Static files (embedded) - register after API routes so /api/* is matched first
 	serverFS := server.NewEmbeddedServer(frontend.FS)

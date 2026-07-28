@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,40 +12,324 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"cups-web/internal/auth"
+
+	"github.com/gorilla/mux"
 )
 
 const (
 	driversDataDir   = "/opt/cups-drivers/data"
 	driversScriptDir = "/opt/cups-drivers/scripts"
+
+	// 自定义上传件在 driversDataDir 下的子目录名。
+	// custom-ppd 走 manifest.txt，能被 restore-drivers.sh 逐文件 cp -a 恢复；
+	// custom-deb 只做归档记录，故意不写 manifest.txt（见 persistUploadedDeb 注释）。
+	customPPDDirName = "custom-ppd"
+	customDebDirName = "custom-deb"
+
+	// 系统 PPD 安装目录：restore-drivers.sh 依赖 manifest 里的绝对路径恢复。
+	customPPDInstallDir = "/usr/share/cups/model/custom"
+
+	// 自定义驱动上传的请求体硬上限（配合 http.MaxBytesReader 生效）。
+	// 厂商 .deb 驱动包通常几 MB 到几十 MB（Canon UFR II 全量包约 40MB 量级），
+	// 留到 64MB 足够，同时避免管理员误传镜像/压缩包把容器磁盘打满。
+	driverUploadMaxBytes = 64 << 20
+
+	// 后台驱动任务的硬超时。canon-capt / foo2zjs-firmware 要现场编译，
+	// arm 设备上十几分钟都可能，留 30 分钟余量。
+	driverJobTimeout = 30 * time.Minute
+	// 已完成任务在内存里的保留时长，超过后清理，避免长期运行的进程无限累积。
+	driverJobRetention = time.Hour
+
+	driverJobRunning   = "running"
+	driverJobSucceeded = "succeeded"
+	driverJobFailed    = "failed"
 )
 
-// GET /api/admin/drivers — list all drivers with installation status.
+// ── 后台驱动任务 ───────────────────────────────────────────────────────────────
+//
+// 为什么必须异步：main.go 的 http.Server 是全局 WriteTimeout = 120s，
+// 而编译型驱动动辄几分钟。用 exec.CommandContext(r.Context(), ...) 同步执行时，
+// 连接一超时请求上下文即被取消，CommandContext 会直接 kill 掉正在 make 的进程，
+// 留下半编译产物、客户端还拿不到结果。因此改成：接口立刻 202 返回 jobId，
+// 真正的命令跑在 context.Background() 派生的 goroutine 里，前端轮询任务状态。
+
+// safeBuffer 是加锁的字节缓冲。exec.Cmd 在后台 goroutine 里往里写，
+// 轮询 handler 同时在读，必须用 mutex 保护（也让轮询能看到进行中的增量输出）。
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// driverJob 的字段全部小写：并发访问统一由 driverJobsMu 保护，
+// 对外序列化时先在锁内快照成 driverJobView，避免 json 编码时读到撕裂状态。
+type driverJob struct {
+	id         string
+	kind       string // install / remove / setup
+	name       string
+	status     string
+	errMsg     string
+	startedAt  time.Time
+	finishedAt time.Time
+	result     map[string]any
+	logBuf     *safeBuffer
+}
+
+type driverJobView struct {
+	ID         string         `json:"id"`
+	Kind       string         `json:"kind"`
+	Name       string         `json:"name,omitempty"`
+	Status     string         `json:"status"`
+	Log        string         `json:"log"`
+	Error      string         `json:"error,omitempty"`
+	StartedAt  string         `json:"startedAt"`
+	FinishedAt string         `json:"finishedAt,omitempty"`
+	Result     map[string]any `json:"result,omitempty"`
+}
+
+var (
+	driverJobsMu sync.Mutex
+	driverJobs   = map[string]*driverJob{}
+)
+
+// viewLocked 必须在持有 driverJobsMu 时调用。
+func (j *driverJob) viewLocked() *driverJobView {
+	v := &driverJobView{
+		ID:        j.id,
+		Kind:      j.kind,
+		Name:      j.name,
+		Status:    j.status,
+		Log:       j.logBuf.String(),
+		Error:     j.errMsg,
+		StartedAt: j.startedAt.Format(time.RFC3339),
+		Result:    j.result,
+	}
+	if !j.finishedAt.IsZero() {
+		v.FinishedAt = j.finishedAt.Format(time.RFC3339)
+	}
+	return v
+}
+
+// pruneDriverJobsLocked 清理完成时间超过 driverJobRetention 的任务。
+func pruneDriverJobsLocked() {
+	cutoff := time.Now().Add(-driverJobRetention)
+	for id, j := range driverJobs {
+		if j.status != driverJobRunning && !j.finishedAt.IsZero() && j.finishedAt.Before(cutoff) {
+			delete(driverJobs, id)
+		}
+	}
+}
+
+// startDriverJob 创建并启动一个后台驱动任务。
+// apt/dpkg 自身有全局锁，并发安装只会互相失败，因此同一时刻只允许一个任务在跑；
+// 已有任务运行中时返回 (nil, 正在跑的 jobId)，由 handler 回 409。
+func startDriverJob(kind, name string, fn func(ctx context.Context, logBuf *safeBuffer) (map[string]any, error)) (*driverJob, string) {
+	driverJobsMu.Lock()
+	defer driverJobsMu.Unlock()
+
+	pruneDriverJobsLocked()
+
+	for _, j := range driverJobs {
+		if j.status == driverJobRunning {
+			return nil, j.id
+		}
+	}
+
+	job := &driverJob{
+		id:        randomToken(),
+		kind:      kind,
+		name:      name,
+		status:    driverJobRunning,
+		startedAt: time.Now(),
+		logBuf:    &safeBuffer{},
+	}
+	driverJobs[job.id] = job
+
+	go func() {
+		// 用 context.Background() 派生，绝不能用 r.Context()：见文件顶部说明。
+		ctx, cancel := context.WithTimeout(context.Background(), driverJobTimeout)
+		defer cancel()
+
+		result, err := fn(ctx, job.logBuf)
+
+		driverJobsMu.Lock()
+		defer driverJobsMu.Unlock()
+		job.finishedAt = time.Now()
+		if err != nil {
+			job.status = driverJobFailed
+			job.errMsg = err.Error()
+			log.Printf("[driver-job] %s(%s) 失败: %v", job.kind, job.name, err)
+		} else {
+			job.status = driverJobSucceeded
+			job.result = result
+			log.Printf("[driver-job] %s(%s) 成功", job.kind, job.name)
+		}
+	}()
+
+	return job, ""
+}
+
+// runningDriverJobID 返回当前正在跑的任务 ID（没有则空串）。
+func runningDriverJobID() string {
+	driverJobsMu.Lock()
+	defer driverJobsMu.Unlock()
+	for _, j := range driverJobs {
+		if j.status == driverJobRunning {
+			return j.id
+		}
+	}
+	return ""
+}
+
+// writeDriverJobBusy 统一回 409，并带上正在跑的 jobId 供前端直接切过去轮询。
+func writeDriverJobBusy(w http.ResponseWriter, jobID string) {
+	writeJSONStatus(w, http.StatusConflict, map[string]any{
+		"error": "已有驱动任务正在执行，请等待其完成后重试",
+		"jobId": jobID,
+	})
+}
+
+// runDriverCommand 执行一条外部命令，stdout/stderr 都写进任务日志缓冲，
+// 这样轮询接口能读到进行中的编译输出，而不是等命令结束才一次性拿到。
+func runDriverCommand(ctx context.Context, logBuf *safeBuffer, name string, args ...string) error {
+	fmt.Fprintf(logBuf, "$ %s %s\n", name, strings.Join(args, " "))
+	cmd := exec.CommandContext(ctx, name, args...)
+	// CUPS_AIO=1 告诉安装脚本这是"CUPS 与 Web 同容器"的形态；
+	// 对 lpadmin 等命令是无害的多余环境变量。
+	cmd.Env = append(os.Environ(), "CUPS_AIO=1")
+	cmd.Stdout = logBuf
+	cmd.Stderr = logBuf
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(logBuf, "!! 命令失败: %v\n", err)
+		return err
+	}
+	return nil
+}
+
+// GET /api/admin/drivers/jobs/{id} — 查询后台驱动任务状态与日志。
+func adminDriverJobHandler(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+
+	driverJobsMu.Lock()
+	var view *driverJobView
+	if job, ok := driverJobs[id]; ok {
+		view = job.viewLocked()
+	}
+	driverJobsMu.Unlock()
+
+	if view == nil {
+		writeJSONError(w, http.StatusNotFound, "unknown job id")
+		return
+	}
+	writeJSON(w, view)
+}
+
+// ── 驱动列表 ───────────────────────────────────────────────────────────────────
+
+// GET /api/admin/drivers — 列出所有已知驱动及安装状态、当前架构、已上传的自定义 .deb。
 func adminListDriversHandler(w http.ResponseWriter, r *http.Request) {
-	var result []DriverStatus
+	arch := currentDebArch()
+
+	drivers := make([]DriverStatus, 0, len(driversRegistry))
 	for _, d := range driversRegistry {
 		status := DriverStatus{DriverMeta: d}
-		manifestPath := filepath.Join(driversDataDir, d.Name, "manifest.txt")
-		if info, err := os.Stat(manifestPath); err == nil {
+		status.Supported = driverSupportsArch(d, arch)
+		// driver-install 是按 install-<name>.sh 找脚本的，镜像里没有脚本就装不了。
+		if _, err := os.Stat(filepath.Join(driversScriptDir, "install-"+d.Name+".sh")); err == nil {
+			status.HasScript = true
+		}
+		if info, err := os.Stat(filepath.Join(driversDataDir, d.Name, "manifest.txt")); err == nil {
 			status.Installed = true
 			status.InstalledAt = info.ModTime().Format(time.RFC3339)
 		}
-		// Also check metadata.txt for an explicit install date.
-		metaPath := filepath.Join(driversDataDir, d.Name, "metadata.txt")
-		if data, err := os.ReadFile(metaPath); err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
-				if strings.HasPrefix(line, "date=") {
-					status.InstalledAt = strings.TrimPrefix(line, "date=")
-				}
-			}
+		// metadata.txt 由 scripts/driver/driver-install.sh 写入，
+		// 键名是 driver= / installed_at= / file_count= / arch=（历史代码读的 date= 永远不命中）。
+		meta := readKeyValueFile(filepath.Join(driversDataDir, d.Name, "metadata.txt"))
+		if v := meta["installed_at"]; v != "" {
+			status.InstalledAt = v
 		}
-		result = append(result, status)
+		status.InstalledArch = meta["arch"]
+		drivers = append(drivers, status)
 	}
-	writeJSON(w, result)
+
+	writeJSON(w, map[string]any{
+		"currentArch": arch,
+		"drivers":     drivers,
+		"customDebs":  listCustomDebs(),
+		// 明确告知前端：.deb 的安装副作用（maintainer script）无法用文件清单恢复，
+		// 容器重启后必须手动重新上传，绝不能静默丢失。
+		"customDebNotice": "上传的 .deb 包不会随容器重启自动恢复，重启后需要重新上传安装。",
+	})
 }
 
-// POST /api/admin/drivers/install — install a driver by name.
+// readKeyValueFile 解析 shell 脚本写出的 key=value 文件。
+// 值可能带尾部空白（脚本里是 echo 拼的），统一 TrimSpace。
+func readKeyValueFile(path string) map[string]string {
+	out := map[string]string{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out
+}
+
+// listCustomDebs 列出已归档的自定义 .deb 上传件（信息性条目，供前端提示重装）。
+// installedAt 用文件 mtime（每个包各自准确）；arch 取目录级 metadata.txt。
+func listCustomDebs() []CustomDebPackage {
+	pkgDir := filepath.Join(driversDataDir, customDebDirName, "packages")
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		return []CustomDebPackage{}
+	}
+	meta := readKeyValueFile(filepath.Join(driversDataDir, customDebDirName, "metadata.txt"))
+
+	result := make([]CustomDebPackage, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".deb") {
+			continue
+		}
+		pkg := CustomDebPackage{Filename: e.Name(), Arch: meta["arch"]}
+		if info, err := e.Info(); err == nil {
+			pkg.InstalledAt = info.ModTime().Format(time.RFC3339)
+			pkg.SizeBytes = info.Size()
+		}
+		result = append(result, pkg)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Filename < result[j].Filename })
+	return result
+}
+
+// ── 安装 / 卸载 ────────────────────────────────────────────────────────────────
+
+// POST /api/admin/drivers/install — 异步安装驱动，返回 202 + jobId。
 func adminInstallDriverHandler(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Name string `json:"name"`
@@ -56,26 +342,37 @@ func adminInstallDriverHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "driver name is required")
 		return
 	}
-	if findDriverByName(payload.Name) == nil {
+	meta := findDriverByName(payload.Name)
+	if meta == nil {
 		writeJSONError(w, http.StatusNotFound, "unknown driver: "+payload.Name)
 		return
 	}
-
-	// Run driver-install synchronously (timeout governed by request context).
-	cmd := exec.CommandContext(r.Context(), "/usr/local/bin/driver-install", payload.Name)
-	cmd.Env = append(os.Environ(), "CUPS_AIO=1")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("[driver-install] %s failed: %v\n%s", payload.Name, err, string(output))
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("driver installation failed: %v", err))
+	arch := currentDebArch()
+	if !driverSupportsArch(*meta, arch) {
+		writeJSONError(w, http.StatusBadRequest,
+			fmt.Sprintf("驱动 %s 不支持当前架构 %s", meta.DisplayName, arch))
 		return
 	}
 
-	log.Printf("[driver-install] %s installed successfully", payload.Name)
-	writeJSON(w, map[string]any{"ok": true, "name": payload.Name, "log": string(output)})
+	name := payload.Name
+	job, busyID := startDriverJob("install", name, func(ctx context.Context, logBuf *safeBuffer) (map[string]any, error) {
+		if err := runDriverCommand(ctx, logBuf, "/usr/local/bin/driver-install", name); err != nil {
+			return nil, fmt.Errorf("driver installation failed: %w", err)
+		}
+		return map[string]any{"name": name}, nil
+	})
+	if job == nil {
+		writeDriverJobBusy(w, busyID)
+		return
+	}
+
+	log.Printf("[driver-install] %s 任务已提交 (job=%s, user=%s)", name, job.id, sessionUsername(r))
+	writeJSONStatus(w, http.StatusAccepted, map[string]any{"jobId": job.id, "name": name})
 }
 
-// POST /api/admin/drivers/remove — remove a driver by name.
+// POST /api/admin/drivers/remove — 异步卸载驱动，返回 202 + jobId。
+// 卸载本身很快，但和安装共享 apt/dpkg 锁，统一走任务系统才能被单飞约束覆盖，
+// 前端也可以复用同一套轮询逻辑。
 func adminRemoveDriverHandler(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Name string `json:"name"`
@@ -89,171 +386,330 @@ func adminRemoveDriverHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.CommandContext(r.Context(), "/usr/local/bin/driver-remove", payload.Name)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("[driver-remove] %s failed: %v\n%s", payload.Name, err, string(output))
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("driver removal failed: %v", err))
+	name := payload.Name
+	job, busyID := startDriverJob("remove", name, func(ctx context.Context, logBuf *safeBuffer) (map[string]any, error) {
+		if err := runDriverCommand(ctx, logBuf, "/usr/local/bin/driver-remove", name); err != nil {
+			return nil, fmt.Errorf("driver removal failed: %w", err)
+		}
+		return map[string]any{"name": name}, nil
+	})
+	if job == nil {
+		writeDriverJobBusy(w, busyID)
 		return
 	}
 
-	writeJSON(w, map[string]any{"ok": true, "name": payload.Name})
+	log.Printf("[driver-remove] %s 任务已提交 (job=%s, user=%s)", name, job.id, sessionUsername(r))
+	writeJSONStatus(w, http.StatusAccepted, map[string]any{"jobId": job.id, "name": name})
 }
 
-// GET /api/admin/drivers/detect — detect connected printers and recommend drivers.
+// ── 检测打印机 ─────────────────────────────────────────────────────────────────
+
+// GET /api/admin/drivers/detect — 检测已连接的打印机并推荐驱动。
 func adminDetectPrintersHandler(w http.ResponseWriter, r *http.Request) {
-	// Run lpinfo -v to discover connected devices.
-	cmd := exec.CommandContext(r.Context(), "lpinfo", "-v")
+	// 必须用长格式 lpinfo -l -v：短格式 lpinfo -v 每行只有 "<class> <uri>" 两列，
+	// 根本没有厂商型号，历史代码按 4 列解析导致型号恒为空 → 驱动匹配与 PPD 查找全线失真。
+	cmd := exec.CommandContext(r.Context(), "lpinfo", "-l", "-v")
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("[driver-detect] lpinfo -v failed: %v", err)
+		log.Printf("[driver-detect] lpinfo -l -v failed: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "failed to detect printers")
 		return
 	}
 
-	// Parse lpinfo -v output.
-	// Format: <type> <uri> "<description>" "<make-and-model>"
-	// Example: direct usb://Canon/LBP2900?serial=XXX "Canon LBP2900" "Canon LBP2900"
-	var printers []DetectedPrinter
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, " ", 3)
-		if len(parts) < 2 {
-			continue
-		}
-		connType := parts[0] // "direct", "network", "serial", etc.
-		uri := parts[1]
+	printers := parseLpinfoDevices(string(output))
 
-		// Determine connection type.
-		connection := connType
-		if strings.Contains(uri, "usb://") {
-			connection = "usb"
-		} else if strings.Contains(uri, "socket://") || strings.Contains(uri, "lpd://") ||
-			strings.Contains(uri, "ipp://") || strings.Contains(uri, "ipps://") ||
-			strings.Contains(uri, "http://") || strings.Contains(uri, "https://") {
-			connection = "network"
-		}
+	// lpinfo -m 输出可能有几千行，整个检测过程只取一次，避免每台设备都 fork 一个进程。
+	models, err := listCUPSModels(r.Context())
+	if err != nil {
+		log.Printf("[driver-detect] lpinfo -m failed (降级为无 PPD 信息): %v", err)
+	}
 
-		// Extract manufacturer and model from URI.
-		manufacturer, model := parseDeviceURI(uri)
-
-		// Also try to get from the description fields (quoted strings).
-		if manufacturer == "" || model == "" {
-			desc := ""
-			if len(parts) >= 3 {
-				desc = parts[2]
-			}
-			if m, mo := parseDescription(desc); manufacturer == "" {
-				manufacturer = m
-				model = mo
-			}
-		}
-
-		// Skip CUPS-PDF, braille, and other virtual printers.
-		if strings.Contains(uri, "cups-pdf") || uri == "file:///dev/null" {
-			continue
-		}
-		if strings.Contains(uri, "cups-brf") {
-			continue
-		}
-
-		printer := DetectedPrinter{
-			DeviceURI:    uri,
-			Manufacturer: manufacturer,
-			Model:        model,
-			Connection:   connection,
-		}
-
-		// Match against driver registry.
-		searchStr := manufacturer + " " + model
+	for i := range printers {
+		p := &printers[i]
+		searchStr := strings.TrimSpace(p.Manufacturer + " " + p.Model)
 		if match := matchDriverForPrinter(searchStr); match != nil {
-			printer.DriverMatch = match
+			p.DriverMatch = match
 		}
-
-		// Check if CUPS already has a matching PPD.
-		printer.HasDriver = checkHasDriver(r.Context(), searchStr)
-
-		printers = append(printers, printer)
+		p.HasDriver = checkHasDriver(models, p.Manufacturer, p.Model)
 	}
 
 	writeJSON(w, printers)
 }
 
-// POST /api/admin/drivers/setup — install driver + add printer to CUPS in one step.
+// parseLpinfoDevices 解析 `lpinfo -l -v` 的长格式输出。
+//
+// CUPS（systemv/lpinfo.c 的 show_devices）在 -l 下每台设备打印一个块：
+//
+//	Device: uri = usb://HP/LaserJet%201020?serial=XXXX
+//	        class = direct
+//	        info = HP LaserJet 1020
+//	        make-and-model = HP LaserJet 1020
+//	        device-id = MFG:HP;MDL:LaserJet 1020;CMD:...;
+//	        location =
+//
+// 本机没有 cups-client 可实测，故解析器按上述格式假设编写并刻意宽容：
+// 以 "Device:" 开块，其余行按第一个 " = " 拆 key/value，未知 key 直接忽略；
+// 万一某版本改了字段顺序或缩进也不会解析失败。
+func parseLpinfoDevices(output string) []DetectedPrinter {
+	// 初始化成空切片而不是 nil：JSON 序列化后是 []，前端可以直接读 .length。
+	printers := []DetectedPrinter{}
+	var cur map[string]string
+
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		if p, ok := buildDetectedPrinter(cur); ok {
+			printers = append(printers, p)
+		}
+		cur = nil
+	}
+
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "Device:"); ok {
+			flush()
+			cur = map[string]string{}
+			line = strings.TrimSpace(rest) // 形如 "uri = usb://..."
+		}
+		if cur == nil {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		cur[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	flush()
+
+	return printers
+}
+
+// buildDetectedPrinter 把一个 lpinfo 设备块转成 DetectedPrinter，
+// 返回 false 表示该块应被丢弃（裸 backend scheme 行、虚拟打印机等）。
+func buildDetectedPrinter(fields map[string]string) (DetectedPrinter, bool) {
+	uri := fields["uri"]
+
+	// lpinfo 还会输出 backend 自身的行（socket / ipp / lpd / beh / http / dnssd / hp …），
+	// 这类行第二列不是完整 URI（没有 "://"），必须过滤掉，否则会凭空多出 5~6 台"假打印机"。
+	if uri == "" || !strings.Contains(uri, "://") {
+		return DetectedPrinter{}, false
+	}
+	// 跳过 CUPS-PDF、盲文等虚拟设备。
+	lowerURI := strings.ToLower(uri)
+	if strings.Contains(lowerURI, "cups-pdf") || strings.Contains(lowerURI, "cups-brf") || uri == "file:///dev/null" {
+		return DetectedPrinter{}, false
+	}
+
+	connection := normalizeDeviceClass(fields["class"], uri)
+
+	// 型号来源按可信度排序：make-and-model → device-id 的 MFG/MDL → info → URI 路径。
+	manufacturer, model := splitMakeAndModel(fields["make-and-model"])
+	if model == "" {
+		manufacturer, model = parseDeviceID(fields["device-id"])
+	}
+	if model == "" {
+		manufacturer, model = splitMakeAndModel(fields["info"])
+	}
+	if model == "" {
+		manufacturer, model = parseDeviceURI(uri)
+	}
+
+	return DetectedPrinter{
+		DeviceURI:    uri,
+		Manufacturer: manufacturer,
+		Model:        model,
+		Connection:   connection,
+	}, true
+}
+
+// normalizeDeviceClass 把 lpinfo 的 class 与 URI scheme 归一成 usb / network / 原值。
+func normalizeDeviceClass(class, uri string) string {
+	switch {
+	case strings.HasPrefix(uri, "usb://"):
+		return "usb"
+	case strings.HasPrefix(uri, "socket://"), strings.HasPrefix(uri, "lpd://"),
+		strings.HasPrefix(uri, "ipp://"), strings.HasPrefix(uri, "ipps://"),
+		strings.HasPrefix(uri, "http://"), strings.HasPrefix(uri, "https://"),
+		strings.HasPrefix(uri, "dnssd://"), strings.HasPrefix(uri, "smb://"):
+		return "network"
+	}
+	if class == "" {
+		return "direct"
+	}
+	return class
+}
+
+// splitMakeAndModel 把 "HP LaserJet 1020" 这种整串拆成厂商 + 型号。
+// CUPS 在拿不到信息时会填 "Unknown"，这种值等价于空。
+func splitMakeAndModel(s string) (manufacturer, model string) {
+	s = strings.TrimSpace(strings.Trim(strings.TrimSpace(s), `"`))
+	if s == "" || strings.EqualFold(s, "unknown") {
+		return "", ""
+	}
+	parts := strings.SplitN(s, " ", 2)
+	manufacturer = strings.TrimSpace(parts[0])
+	if len(parts) > 1 {
+		model = strings.TrimSpace(parts[1])
+	}
+	// 只有一个词时（例如 "LBP2900"）当型号处理，厂商留空由驱动匹配自行兜底。
+	if model == "" {
+		return "", manufacturer
+	}
+	return manufacturer, model
+}
+
+// parseDeviceID 从 IEEE 1284 device-id 串里取 MFG/MDL（含 MANUFACTURER/MODEL 长写法）。
+func parseDeviceID(id string) (manufacturer, model string) {
+	for _, kv := range strings.Split(id, ";") {
+		k, v, ok := strings.Cut(kv, ":")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch strings.ToUpper(strings.TrimSpace(k)) {
+		case "MFG", "MANUFACTURER":
+			manufacturer = v
+		case "MDL", "MODEL":
+			model = v
+		}
+	}
+	// 型号里常带厂商前缀（"HP LaserJet 1020"），去重以免拼出 "HP HP LaserJet 1020"。
+	if manufacturer != "" && strings.HasPrefix(strings.ToLower(model), strings.ToLower(manufacturer)+" ") {
+		model = strings.TrimSpace(model[len(manufacturer):])
+	}
+	return
+}
+
+// ── 一键设置打印机 ─────────────────────────────────────────────────────────────
+
+// POST /api/admin/drivers/setup — 安装驱动 + lpadmin 添加打印机，异步执行返回 202 + jobId。
+// 字段名以 /detect 的响应为准（deviceUri），历史前端发的 {uri, driverMatch, installDriver}
+// 与后端完全不匹配，导致这条主路径 100% 返回 400。
 func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		DeviceURI  string `json:"deviceUri"`
-		DriverName string `json:"driverName"`
+		DeviceURI    string `json:"deviceUri"`
+		DriverName   string `json:"driverName"`
+		Manufacturer string `json:"manufacturer"`
+		Model        string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	payload.DeviceURI = strings.TrimSpace(payload.DeviceURI)
 	if payload.DeviceURI == "" {
 		writeJSONError(w, http.StatusBadRequest, "deviceUri is required")
 		return
 	}
-
-	ctx := r.Context()
-	driverInstalled := false
-
-	// Step 1: Install driver if specified and not already installed.
 	if payload.DriverName != "" {
-		manifestPath := filepath.Join(driversDataDir, payload.DriverName, "manifest.txt")
-		if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
-			cmd := exec.CommandContext(ctx, "/usr/local/bin/driver-install", payload.DriverName)
-			cmd.Env = append(os.Environ(), "CUPS_AIO=1")
-			if output, err := cmd.CombinedOutput(); err != nil {
-				log.Printf("[driver-setup] install %s failed: %v\n%s", payload.DriverName, err, string(output))
-				writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("driver installation failed: %v", err))
-				return
-			}
-			driverInstalled = true
+		meta := findDriverByName(payload.DriverName)
+		if meta == nil {
+			writeJSONError(w, http.StatusNotFound, "unknown driver: "+payload.DriverName)
+			return
+		}
+		arch := currentDebArch()
+		if !driverSupportsArch(*meta, arch) {
+			writeJSONError(w, http.StatusBadRequest,
+				fmt.Sprintf("驱动 %s 不支持当前架构 %s", meta.DisplayName, arch))
+			return
 		}
 	}
 
-	// Step 2: Find best PPD for the printer.
-	_, model := parseDeviceURI(payload.DeviceURI)
-	ppdURI := findBestPPD(ctx, model)
+	req := payload
+	job, busyID := startDriverJob("setup", req.DriverName, func(ctx context.Context, logBuf *safeBuffer) (map[string]any, error) {
+		driverInstalled := false
 
-	// Step 3: Generate printer name from model.
-	printerName := sanitizePrinterName(model)
-	if printerName == "" {
-		printerName = "Printer"
-	}
+		// 第 1 步：驱动未安装时先装（manifest.txt 是 driver-install 的安装标记）。
+		if req.DriverName != "" {
+			manifestPath := filepath.Join(driversDataDir, req.DriverName, "manifest.txt")
+			if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+				if err := runDriverCommand(ctx, logBuf, "/usr/local/bin/driver-install", req.DriverName); err != nil {
+					return nil, fmt.Errorf("driver installation failed: %w", err)
+				}
+				driverInstalled = true
+			} else {
+				fmt.Fprintf(logBuf, "驱动 %s 已安装，跳过安装步骤\n", req.DriverName)
+			}
+		}
 
-	// Step 4: Add printer with lpadmin.
-	args := []string{"-p", printerName, "-E", "-v", payload.DeviceURI}
-	if ppdURI != "" {
-		args = append(args, "-m", ppdURI)
-	}
-	cmd := exec.CommandContext(ctx, "lpadmin", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[driver-setup] lpadmin failed: %v\n%s", err, string(output))
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to add printer: %v", err))
+		// 第 2 步：确定厂商/型号。URI 只有 usb:// 才带厂商型号，
+		// 网络打印机解析不出来时用请求里带来的（来自 /detect 的 lpinfo make-and-model）补全。
+		manufacturer, model := parseDeviceURI(req.DeviceURI)
+		if strings.TrimSpace(model) == "" {
+			manufacturer, model = strings.TrimSpace(req.Manufacturer), strings.TrimSpace(req.Model)
+		}
+
+		// 第 3 步：挑 PPD。挑不到就不传 -m，让 CUPS 走 driverless/IPP Everywhere，
+		// 这是安全的降级——比硬套一个无关 PPD 好得多。
+		ppdURI := findBestPPD(ctx, manufacturer, model)
+		if ppdURI == "" {
+			fmt.Fprintf(logBuf, "未找到匹配的 PPD，将由 CUPS 自动选择（driverless / IPP Everywhere）\n")
+		} else {
+			fmt.Fprintf(logBuf, "使用 PPD: %s\n", ppdURI)
+		}
+
+		// 第 4 步：生成打印机名。
+		printerName := sanitizePrinterName(model)
+		if printerName == "" {
+			printerName = sanitizePrinterName(manufacturer)
+		}
+		if printerName == "" {
+			printerName = "Printer"
+		}
+
+		// 第 5 步：lpadmin 添加并启用。
+		args := []string{"-p", printerName, "-E", "-v", req.DeviceURI}
+		if ppdURI != "" {
+			args = append(args, "-m", ppdURI)
+		}
+		if err := runDriverCommand(ctx, logBuf, "lpadmin", args...); err != nil {
+			return nil, fmt.Errorf("failed to add printer: %w", err)
+		}
+
+		// 第 6 步：默认纸张设为 A4（国内场景），失败不影响整体成功。
+		if err := runDriverCommand(ctx, logBuf, "lpadmin", "-p", printerName, "-o", "media=iso_a4_210x297mm"); err != nil {
+			fmt.Fprintf(logBuf, "设置 A4 默认纸张失败（不影响使用）: %v\n", err)
+		}
+
+		return map[string]any{
+			"printerName":     printerName,
+			"driverInstalled": driverInstalled,
+			"ppdUsed":         ppdURI,
+		}, nil
+	})
+	if job == nil {
+		writeDriverJobBusy(w, busyID)
 		return
 	}
 
-	// Step 5: Set default paper to A4.
-	cmd = exec.CommandContext(ctx, "lpadmin", "-p", printerName, "-o", "media=iso_a4_210x297mm")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[driver-setup] set A4 default failed (non-fatal): %v\n%s", err, string(output))
-	}
-
-	writeJSON(w, map[string]any{
-		"ok":              true,
-		"printerName":     printerName,
-		"driverInstalled": driverInstalled,
-		"ppdUsed":         ppdURI,
-	})
+	log.Printf("[driver-setup] %s 任务已提交 (job=%s, driver=%q, user=%s)",
+		req.DeviceURI, job.id, req.DriverName, sessionUsername(r))
+	writeJSONStatus(w, http.StatusAccepted, map[string]any{"jobId": job.id, "name": req.DriverName})
 }
 
-// POST /api/admin/drivers/upload — upload a custom PPD or .deb package.
+// ── 上传自定义驱动 ─────────────────────────────────────────────────────────────
+
+// POST /api/admin/drivers/upload — 上传自定义 PPD 或 .deb 包。
+//
+// ⚠️ 安全风险面（有意保留的管理员能力，但必须知情）：
+// 上传 .deb 等价于把容器内 root 代码执行权交给管理员——dpkg 会以 root 执行包里的
+// maintainer script（preinst/postinst 等），可以做任何事。该接口已受
+// RequireSession + RequireAdmin + ValidateCSRF 三重保护，且每次上传都会把上传者
+// 用户名写进日志用于审计；部署时请把管理员账号密码视作等同于容器 root 凭据。
 func adminUploadDriverHandler(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(50 << 20); err != nil { // 50 MB limit
-		writeJSONError(w, http.StatusBadRequest, "file too large or invalid form")
+	// ParseMultipartForm 的参数是 **maxMemory（内存缓冲上限）而不是请求体上限**：
+	// 超出部分 Go 会静默落到临时文件，所以单靠它拦不住超大上传（原注释写的
+	// "50 MB limit" 是对 Go 语义的误解）。真正的硬上限要用 MaxBytesReader 包一层
+	// r.Body，超限时 ParseMultipartForm 才会返回错误。
+	// maxMemory 单独给一个小值（8MB），让大包 spool 到磁盘而不是整个塞进内存。
+	r.Body = http.MaxBytesReader(w, r.Body, driverUploadMaxBytes)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "文件过大或表单格式错误（单个驱动文件上限 64MB）")
 		return
 	}
 
@@ -264,56 +720,50 @@ func adminUploadDriverHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	filename := header.Filename
+	// 显式做一次 Base + 白名单校验：不要依赖 multipart 实现内部恰好做了 filepath.Base，
+	// 否则一旦标准库行为变化就会变成目录穿越写任意文件。
+	filename, err := safeUploadFilename(header.Filename)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	username := sessionUsername(r)
 	ext := strings.ToLower(filepath.Ext(filename))
 
 	switch ext {
 	case ".ppd":
-		// Install PPD file.
-		ppdDir := "/usr/share/cups/model/custom"
-		os.MkdirAll(ppdDir, 0755)
-		destPath := filepath.Join(ppdDir, filename)
-
-		// Validate PPD content.
 		content, err := io.ReadAll(file)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to read file")
 			return
 		}
-		n := len(content)
-		if n > 256 {
-			n = 256
+		// 校验 PPD 头（只看开头一小段，PPD 规范要求首行就是 *PPD-Adobe）。
+		head := content
+		if len(head) > 256 {
+			head = head[:256]
 		}
-		if !strings.Contains(string(content[:n]), "*PPD-Adobe") {
+		if !strings.Contains(string(head), "*PPD-Adobe") {
 			writeJSONError(w, http.StatusBadRequest, "invalid PPD file (missing *PPD-Adobe header)")
 			return
 		}
 
-		if err := os.WriteFile(destPath, content, 0644); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "failed to save PPD")
+		if err := installCustomPPD(filename, content); err != nil {
+			log.Printf("[driver-upload] PPD %s 安装失败 (user=%s): %v", filename, username, err)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to install PPD: %v", err))
 			return
 		}
 
-		// Persist to driver data so it survives container restarts.
-		persistDir := filepath.Join(driversDataDir, "custom-ppd", "usr/share/cups/model/custom")
-		os.MkdirAll(persistDir, 0755)
-		os.WriteFile(filepath.Join(persistDir, filename), content, 0644)
-
-		// Update manifest.
-		manifestDir := filepath.Join(driversDataDir, "custom-ppd")
-		manifestPath := filepath.Join(manifestDir, "manifest.txt")
-		f, _ := os.OpenFile(manifestPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if f != nil {
-			fmt.Fprintf(f, "/usr/share/cups/model/custom/%s\n", filename)
-			f.Close()
-		}
-
-		log.Printf("[driver-upload] installed PPD: %s", filename)
+		log.Printf("[driver-upload] 已安装 PPD: %s (user=%s)", filename, username)
 		writeJSON(w, map[string]any{"ok": true, "type": "ppd", "filename": filename})
 
 	case ".deb":
-		// Save and install deb package.
-		tmpFile, err := os.CreateTemp("/tmp", "driver-upload-*.deb")
+		// dpkg 有全局锁，正在跑的驱动任务会和它抢锁，直接拒绝更清晰。
+		if busyID := runningDriverJobID(); busyID != "" {
+			writeDriverJobBusy(w, busyID)
+			return
+		}
+
+		tmpFile, err := os.CreateTemp("", "driver-upload-*.deb")
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to create temp file")
 			return
@@ -326,29 +776,185 @@ func adminUploadDriverHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "failed to save file")
 			return
 		}
-		tmpFile.Close()
+		if err := tmpFile.Close(); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to save file")
+			return
+		}
 
-		cmd := exec.CommandContext(r.Context(), "dpkg", "-i", tmpPath)
-		output, err := cmd.CombinedOutput()
+		log.Printf("[driver-upload] 开始安装 deb: %s (user=%s)", filename, username)
+		installLog, err := installDebPackage(r.Context(), tmpPath)
 		if err != nil {
-			// Try apt-get -f install to fix dependencies.
-			fixCmd := exec.CommandContext(r.Context(), "apt-get", "install", "-y", "-f", "--no-install-recommends")
-			fixCmd.CombinedOutput()
-
-			log.Printf("[driver-upload] dpkg -i failed: %v\n%s", err, string(output))
+			log.Printf("[driver-upload] deb %s 安装失败 (user=%s): %v\n%s", filename, username, err, installLog)
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("package installation failed: %v", err))
 			return
 		}
 
-		log.Printf("[driver-upload] installed deb: %s", filename)
-		writeJSON(w, map[string]any{"ok": true, "type": "deb", "filename": filename})
+		// 归档原件，至少让用户在列表里看得到"装过什么"；
+		// 归档失败不影响本次安装成功，只是重启后无从追溯，故降级为警告。
+		warning := "该 .deb 不会随容器重启自动恢复，重启后需要重新上传安装。"
+		if err := persistUploadedDeb(filename, tmpPath, username); err != nil {
+			log.Printf("[driver-upload] deb %s 归档失败 (user=%s): %v", filename, username, err)
+			warning = "该 .deb 安装成功但归档失败，容器重启后需要重新上传安装（且列表中不会显示该包）。"
+		}
+
+		log.Printf("[driver-upload] 已安装 deb: %s (user=%s)", filename, username)
+		writeJSON(w, map[string]any{
+			"ok":       true,
+			"type":     "deb",
+			"filename": filename,
+			"warning":  warning,
+			"log":      installLog,
+		})
 
 	default:
 		writeJSONError(w, http.StatusBadRequest, "unsupported file type (use .ppd or .deb)")
 	}
 }
 
+// safeUploadFilename 把上传文件名收敛为安全的纯文件名。
+func safeUploadFilename(raw string) (string, error) {
+	// Windows 客户端可能带反斜杠路径，filepath.Base 在 Linux 上不认，先手工切一次。
+	if idx := strings.LastIndexAny(raw, `\/`); idx >= 0 {
+		raw = raw[idx+1:]
+	}
+	name := filepath.Base(strings.TrimSpace(raw))
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) ||
+		strings.ContainsAny(name, `/\`) || strings.HasPrefix(name, ".") {
+		return "", errors.New("invalid file name")
+	}
+	return name, nil
+}
+
+// installCustomPPD 写入系统 PPD 目录，并持久化到驱动数据目录 + 追加 manifest，
+// 让 restore-drivers.sh 在容器重启后能按 manifest 逐文件恢复。
+func installCustomPPD(filename string, content []byte) error {
+	if err := os.MkdirAll(customPPDInstallDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", customPPDInstallDir, err)
+	}
+	installPath := filepath.Join(customPPDInstallDir, filename)
+	if err := os.WriteFile(installPath, content, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", installPath, err)
+	}
+
+	// 持久化副本的目录结构必须和 manifest 里的绝对路径一一对应：
+	// restore-drivers.sh 是用 "${driver_dir}${filepath}" 拼源文件路径的。
+	persistDir := filepath.Join(driversDataDir, customPPDDirName, customPPDInstallDir)
+	if err := os.MkdirAll(persistDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", persistDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(persistDir, filename), content, 0o644); err != nil {
+		return fmt.Errorf("persist ppd: %w", err)
+	}
+
+	manifestPath := filepath.Join(driversDataDir, customPPDDirName, "manifest.txt")
+	// manifest 里存的是容器内的绝对路径（restore-drivers.sh 直接当路径用），
+	// 固定用 "/" 拼接而不是 filepath.Join，语义上就是 POSIX 路径。
+	entry := customPPDInstallDir + "/" + filename
+	if err := appendManifestLine(manifestPath, entry); err != nil {
+		return fmt.Errorf("update manifest: %w", err)
+	}
+
+	// 与 driver-install.sh 保持同一套 metadata 键名，前端/排障脚本可以统一读。
+	metaPath := filepath.Join(driversDataDir, customPPDDirName, "metadata.txt")
+	meta := fmt.Sprintf("driver=%s\ninstalled_at=%s\narch=%s\n",
+		customPPDDirName, time.Now().Format(time.RFC3339), currentDebArch())
+	if err := os.WriteFile(metaPath, []byte(meta), 0o644); err != nil {
+		return fmt.Errorf("write metadata: %w", err)
+	}
+	return nil
+}
+
+// appendManifestLine 追加一条 manifest 记录，已存在则跳过（重复上传同名 PPD 时避免膨胀）。
+func appendManifestLine(manifestPath, entry string) error {
+	if data, err := os.ReadFile(manifestPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == entry {
+				return nil
+			}
+		}
+	}
+	f, err := os.OpenFile(manifestPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, writeErr := fmt.Fprintf(f, "%s\n", entry)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+// installDebPackage 安装 .deb：dpkg -i 失败 → apt-get -f install 补依赖 → 再 dpkg -i 一次。
+// 历史实现修完依赖后没有重装，等于白跑一趟 apt。
+func installDebPackage(ctx context.Context, debPath string) (string, error) {
+	var logBuf safeBuffer
+
+	err := runDriverCommand(ctx, &logBuf, "dpkg", "-i", debPath)
+	if err == nil {
+		return logBuf.String(), nil
+	}
+
+	fmt.Fprintf(&logBuf, "dpkg -i 失败，尝试用 apt-get -f install 修复依赖后重试\n")
+	if fixErr := runDriverCommand(ctx, &logBuf, "apt-get", "install", "-y", "-f", "--no-install-recommends"); fixErr != nil {
+		return logBuf.String(), fmt.Errorf("dpkg -i 失败 (%v)，apt-get -f install 也失败 (%v)", err, fixErr)
+	}
+	if retryErr := runDriverCommand(ctx, &logBuf, "dpkg", "-i", debPath); retryErr != nil {
+		return logBuf.String(), fmt.Errorf("修复依赖后 dpkg -i 仍失败: %w", retryErr)
+	}
+	return logBuf.String(), nil
+}
+
+// persistUploadedDeb 把上传的 .deb 原件归档到 {driversDataDir}/custom-deb/packages/。
+//
+// 为什么故意不写 manifest.txt：restore-drivers.sh 是按 manifest 里的绝对路径
+// 逐文件 cp -a 回文件系统的，对 .deb 毫无意义（真正的安装动作在 maintainer script 里，
+// 复制一个 .deb 文件到某处不会让驱动生效），写了反而会把 .deb 拷到奇怪的位置。
+// 因此这里只做归档 + 元数据记录，由 /api/admin/drivers 列出来提示用户手动重装。
+func persistUploadedDeb(filename, tmpPath, username string) error {
+	baseDir := filepath.Join(driversDataDir, customDebDirName)
+	pkgDir := filepath.Join(baseDir, "packages")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", pkgDir, err)
+	}
+
+	src, err := os.Open(tmpPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	destPath := filepath.Join(pkgDir, filename)
+	dest, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dest, src); err != nil {
+		dest.Close()
+		return err
+	}
+	if err := dest.Close(); err != nil {
+		return err
+	}
+
+	meta := fmt.Sprintf("driver=%s\ninstalled_at=%s\narch=%s\nuploaded_by=%s\nlast_package=%s\n",
+		customDebDirName, time.Now().Format(time.RFC3339), currentDebArch(), username, filename)
+	if err := os.WriteFile(filepath.Join(baseDir, "metadata.txt"), []byte(meta), 0o644); err != nil {
+		return fmt.Errorf("write metadata: %w", err)
+	}
+	return nil
+}
+
 // ── Helper functions ──────────────────────────────────────────────────────────
+
+// sessionUsername 取当前登录用户名，用于审计日志（会话解不出来时返回 "unknown"）。
+func sessionUsername(r *http.Request) string {
+	sess, err := auth.GetSession(r)
+	if err != nil || sess.Username == "" {
+		return "unknown"
+	}
+	return sess.Username
+}
 
 // parseDeviceURI extracts manufacturer and model from a CUPS device URI.
 func parseDeviceURI(uri string) (manufacturer, model string) {
@@ -370,64 +976,65 @@ func parseDeviceURI(uri string) (manufacturer, model string) {
 	return
 }
 
-// parseDescription extracts manufacturer and model from lpinfo quoted description fields.
-func parseDescription(desc string) (manufacturer, model string) {
-	desc = strings.TrimSpace(desc)
-	if len(desc) >= 2 && desc[0] == '"' {
-		end := strings.Index(desc[1:], "\"")
-		if end >= 0 {
-			fullName := desc[1 : end+1]
-			parts := strings.SplitN(fullName, " ", 2)
-			if len(parts) >= 1 {
-				manufacturer = parts[0]
-			}
-			if len(parts) >= 2 {
-				model = parts[1]
-			}
-		}
-	}
-	return
-}
-
-// checkHasDriver returns true if CUPS already has a PPD matching the model string.
-func checkHasDriver(ctx context.Context, modelStr string) bool {
-	cmd := exec.CommandContext(ctx, "lpinfo", "-m")
-	output, err := cmd.Output()
+// listCUPSModels 返回 `lpinfo -m` 的输出行（每行 "<ppd-uri> <make-and-model>"）。
+func listCUPSModels(ctx context.Context) ([]string, error) {
+	output, err := exec.CommandContext(ctx, "lpinfo", "-m").Output()
 	if err != nil {
-		return false
+		return nil, err
 	}
-	lowerModel := strings.ToLower(modelStr)
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.Contains(strings.ToLower(line), lowerModel) {
-			return true
-		}
-	}
-	return false
+	return strings.Split(string(output), "\n"), nil
 }
 
-// findBestPPD searches CUPS for the best matching PPD URI for a given model.
-func findBestPPD(ctx context.Context, model string) string {
-	cmd := exec.CommandContext(ctx, "lpinfo", "-m")
-	output, err := cmd.Output()
+// checkHasDriver 判断 CUPS 里是否已存在匹配该打印机的 PPD。
+// 直接复用 findBestPPDFromModels：「能挑出 PPD」才是「已就绪」的定义，
+// 两处口径一致才不会出现"UI 显示已就绪、lpadmin 却挑不出 PPD"的割裂。
+func checkHasDriver(models []string, manufacturer, model string) bool {
+	return findBestPPDFromModels(models, manufacturer, model) != ""
+}
+
+// findBestPPD 查询 CUPS 并挑出最匹配的 PPD URI，挑不到返回空串。
+func findBestPPD(ctx context.Context, manufacturer, model string) string {
+	models, err := listCUPSModels(ctx)
 	if err != nil {
 		return ""
 	}
+	return findBestPPDFromModels(models, manufacturer, model)
+}
 
-	lowerModel := strings.ToLower(model)
-	for _, line := range strings.Split(string(output), "\n") {
+// findBestPPDFromModels 在 `lpinfo -m` 的行集合里挑 PPD：
+// 先按「厂商 + 型号」整串匹配，退一步只匹配型号，都不中就返回空串。
+//
+// 型号解析失败时必须短路：用空串（或单空格）去 strings.Contains 恒为 true，
+// 会把 lpinfo -m 的第一条 PPD 随机套到打印机上——这是历史实现最危险的缺陷。
+func findBestPPDFromModels(models []string, manufacturer, model string) string {
+	model = strings.TrimSpace(model)
+	// 单字符型号（"L" 之类的解析残渣）会命中海量无关 PPD，同样视为无效。
+	if len(model) < 2 {
+		return ""
+	}
+
+	full := strings.ToLower(strings.TrimSpace(strings.TrimSpace(manufacturer) + " " + model))
+	only := strings.ToLower(model)
+
+	fallback := ""
+	for _, line := range models {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		if strings.Contains(strings.ToLower(line), lowerModel) {
-			// Extract the PPD URI (first space-separated field).
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) >= 1 {
-				return parts[0]
-			}
+		ppd, desc, ok := strings.Cut(line, " ")
+		if !ok || ppd == "" {
+			continue
+		}
+		desc = strings.ToLower(desc)
+		if strings.Contains(desc, full) {
+			return ppd
+		}
+		if fallback == "" && strings.Contains(desc, only) {
+			fallback = ppd
 		}
 	}
-	return ""
+	return fallback
 }
 
 // sanitizePrinterName converts a model string into a valid CUPS printer name.

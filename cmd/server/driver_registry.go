@@ -2,6 +2,7 @@ package main
 
 import (
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -18,8 +19,28 @@ type DriverMeta struct {
 // DriverStatus extends DriverMeta with installation state.
 type DriverStatus struct {
 	DriverMeta
-	Installed   bool   `json:"installed"`
+	Installed bool `json:"installed"`
+	// InstalledAt 取自 metadata.txt 的 installed_at=，缺失时退回 manifest.txt 的 mtime。
 	InstalledAt string `json:"installedAt,omitempty"`
+	// InstalledArch 取自 metadata.txt 的 arch=：驱动数据目录是挂载卷，
+	// 用户可能把 amd64 上装好的卷搬到 arm64 机器上，架构不一致时前端要提示重装。
+	InstalledArch string `json:"installedArch,omitempty"`
+	// Supported 表示该驱动是否支持当前运行架构（Arch 含 "all" 或含当前架构）。
+	// 前端据此禁用「安装」按钮，避免用户在 armhf 上点了必然失败的 amd64 专有驱动。
+	Supported bool `json:"supported"`
+	// HasScript 表示镜像里确实存在 install-<name>.sh；镜像瘦身或裁剪脚本时
+	// 注册表可能领先于实际脚本，提前暴露出来比让 driver-install 报错更友好。
+	HasScript bool `json:"hasScript"`
+}
+
+// CustomDebPackage 描述一个通过 /api/admin/drivers/upload 上传的 .deb 包。
+// 它只做「记录」用途：.deb 的 maintainer script 副作用无法用 manifest 文件级
+// 恢复（见 restore-drivers.sh 的按行 cp -a 逻辑），因此容器重启后需要手动重装。
+type CustomDebPackage struct {
+	Filename    string `json:"filename"`
+	InstalledAt string `json:"installedAt,omitempty"`
+	Arch        string `json:"installedArch,omitempty"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
 }
 
 // DetectedPrinter represents a printer discovered via lpinfo.
@@ -109,6 +130,39 @@ func matchDriverForPrinter(modelStr string) *DriverMeta {
 		}
 	}
 	return nil
+}
+
+// currentDebArch 把 Go 的 GOARCH 映射成 Debian 架构名，好和注册表里
+// DriverMeta.Arch（写的是 amd64 / arm64 / armhf 这套 Debian 命名）直接比对。
+// 二进制是 CGO_ENABLED=0 交叉编译的，GOARCH 就是运行架构；未知架构原样返回，
+// 让前端至少能显示出来而不是伪装成 amd64。
+func currentDebArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "amd64"
+	case "arm64":
+		return "arm64"
+	case "arm":
+		return "armhf"
+	case "386":
+		return "i386"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+// driverSupportsArch 判断驱动是否支持给定架构。Arch 为空视为通用（不做限制），
+// 含 "all" 表示纯脚本/固件类驱动与架构无关。
+func driverSupportsArch(d DriverMeta, arch string) bool {
+	if len(d.Arch) == 0 {
+		return true
+	}
+	for _, a := range d.Arch {
+		if a == "all" || strings.EqualFold(a, arch) {
+			return true
+		}
+	}
+	return false
 }
 
 // findDriverByName looks up a driver by its canonical name.
