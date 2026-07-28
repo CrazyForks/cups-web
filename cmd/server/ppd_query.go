@@ -459,9 +459,12 @@ func verifyPrinterQueue(ctx context.Context, logBuf *safeBuffer, printerName str
 	}
 
 	// IPP 属性查询（只告警，部署方可能封了 loopback）。
+	// IPP 数据比 lpoptions 更权威，成功时覆盖；失败时保留 lpoptions 的统计值。
 	localURI := fmt.Sprintf("http://localhost:631/printers/%s", printerName)
 	if pinfo, err := ipp.GetPrinterAttributes(localURI); err == nil && pinfo != nil {
-		mediaSourceCount = len(pinfo.MediaSourceSupported)
+		if len(pinfo.MediaSourceSupported) > 0 {
+			mediaSourceCount = len(pinfo.MediaSourceSupported)
+		}
 	} else if err != nil {
 		warnings = append(warnings, fmt.Sprintf("IPP 属性查询失败（不影响使用）: %v", err))
 	}

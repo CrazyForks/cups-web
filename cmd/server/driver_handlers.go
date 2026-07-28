@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -539,8 +540,8 @@ func adminListPPDCandidatesHandler(w http.ResponseWriter, r *http.Request) {
 	model := strings.TrimSpace(q.Get("model"))
 	limit := 8
 	if v := q.Get("limit"); v != "" {
-		if n, err := fmt.Sscanf(v, "%d", &limit); n != 1 || err != nil || limit < 1 || limit > 20 {
-			limit = 8
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 20 {
+			limit = n
 		}
 	}
 
@@ -925,19 +926,12 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 		if base == "" {
 			base = "Printer"
 		}
-		printerName, isNew, nameErr := func() (string, bool, error) {
-			name, err := uniquePrinterNameChecked(base, queues)
-			if err != nil {
-				return "", false, err
-			}
-			_, taken := queues[name]
-			return name, !taken, nil
-		}()
+		printerName, nameErr := uniquePrinterNameChecked(base, queues)
 		if nameErr != nil {
 			return nil, nameErr
 		}
 		renamedFrom := ""
-		if !isNew {
+		if printerName != base {
 			renamedFrom = base
 		}
 
@@ -947,24 +941,22 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 		if expectPPD {
 			args = append(args, "-m", ppdURI)
 		}
-		if err := runDriverCommand(ctx, logBuf, "lpadmin", args...); err != nil {
-			// -m everywhere 失败时自动降级重试一次 Top-1（lpadmin 失败时队列不会被创建，重试无副作用）。
-			if ppdURI == "everywhere" && len(cands) > 0 {
-				fallback := bestPPDFromCandidates(cands)
-				if fallback != "" {
-					fmt.Fprintf(logBuf, "everywhere 失败，降级重试 PPD: %s\n", fallback)
-					args2 := []string{"-p", printerName, "-E", "-v", req.DeviceURI, "-m", fallback}
-					if err2 := runDriverCommand(ctx, logBuf, "lpadmin", args2...); err2 == nil {
-						ppdURI = fallback
-						decision = "auto-top1"
-						expectPPD = true
-						err = nil
-					}
+		lpadminErr := runDriverCommand(ctx, logBuf, "lpadmin", args...)
+		// -m everywhere 失败时自动降级重试一次 Top-1（lpadmin 失败时队列不会被创建，重试无副作用）。
+		if lpadminErr != nil && ppdURI == "everywhere" && len(cands) > 0 {
+			if fallback := bestPPDFromCandidates(cands); fallback != "" {
+				fmt.Fprintf(logBuf, "everywhere 失败，降级重试 PPD: %s\n", fallback)
+				args2 := []string{"-p", printerName, "-E", "-v", req.DeviceURI, "-m", fallback}
+				if err2 := runDriverCommand(ctx, logBuf, "lpadmin", args2...); err2 == nil {
+					ppdURI = fallback
+					decision = "auto-top1"
+					expectPPD = true
+					lpadminErr = nil
 				}
 			}
-			if err != nil {
-				return nil, fmt.Errorf("failed to add printer: %w", err)
-			}
+		}
+		if lpadminErr != nil {
+			return nil, fmt.Errorf("failed to add printer: %w", lpadminErr)
 		}
 
 		// 第 6 步：默认纸张设为 A4（国内场景），失败不影响整体成功。
@@ -975,11 +967,10 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 		// 第 7 步：验证队列是否真正生效。
 		optionCount, mediaSourceCount, warnings := verifyPrinterQueue(ctx, logBuf, printerName, expectPPD)
 		if expectPPD && optionCount == 0 {
-			// PPD 没真正生效（"假成功 raw 队列"）→ 回滚。
-			if isNew {
-				fmt.Fprintf(logBuf, "PPD 未生效，回滚删除队列 %s\n", printerName)
-				runDriverCommand(ctx, logBuf, "lpadmin", "-x", printerName)
-			}
+			// PPD 没真正生效（"假成功 raw 队列"）→ 回滚删除。
+			// 走到这里的队列一定是本次 lpadmin 新建的（前面 findQueueByURI 已拒绝过重复 URI）。
+			fmt.Fprintf(logBuf, "PPD 未生效，回滚删除队列 %s\n", printerName)
+			runDriverCommand(ctx, logBuf, "lpadmin", "-x", printerName)
 			return nil, fmt.Errorf("PPD 未真正生效（lpoptions 输出为空），队列可能是 raw 模式")
 		}
 		for _, w := range warnings {
