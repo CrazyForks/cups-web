@@ -130,6 +130,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libusb-1.0-0-dev \
       zlib1g-dev \
       wget \
+      # install-cups.sh 用 wget 从 GitHub Releases 下载 CUPS tarball，必须有 CA 根证书才能
+      # 校验 TLS；debian:trixie-slim 默认不带 ca-certificates，缺失时 wget 直接以退出码 5
+      # （SSL verification failure）失败，脚本的 set -euo pipefail 会把整个构建带崩（CI 报
+      # "install-cups.sh ... exit code: 5"）。旧的单阶段 cups/Dockerfile 因为运行时依赖里
+      # 已经包含它才没暴露这个问题，拆成独立 builder 阶段后必须显式声明——请勿删除。
+      ca-certificates \
       cups-daemon \
       cups-filters \
       dpkg-dev \
@@ -221,6 +227,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fontconfig \
     && fc-cache -f \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ────────────────────────────────────────────────────────────────
+# HOME / LibreOffice user profile 目录
+# ────────────────────────────────────────────────────────────────
+# 为什么要显式声明而不是依赖容器隐式的 HOME=/root：
+#   1. LibreOffice headless 启动时必须有一个**可写的 HOME** 来落 user profile
+#      （~/.config/libreoffice/4/user），拿不到就静默退出、`--convert-to pdf`
+#      返回 0 但不产出 PDF，排查起来非常隐蔽；dconf 同理会往 ~/.cache/dconf 写。
+#   2. Docker 只在 USER 指令指向 /etc/passwd 里的用户时才隐式给出 HOME。如果部署方
+#      用 k8s `securityContext.runAsUser` 换成任意 uid（或 `docker run -u`），该 uid
+#      不在 /etc/passwd 里，HOME 会退化成 `/`，转换就开始莫名失败。写死 ENV 后
+#      至少路径是确定的，只需保证挂载/权限可写即可，故障可诊断。
+# 目录预建同理：让首次转换不必等 LibreOffice 自己去创建目录树。
+ENV HOME=/root
+ENV XDG_CACHE_HOME=/root/.cache
+ENV DCONF_USER_CONFIG_DIR=/root/.config/dconf
+RUN mkdir -p /root/.cache/dconf /root/.config/libreoffice /root/.local/share/libreoffice \
+    && chmod 700 /root/.cache/dconf
 
 # ────────────────────────────────────────────────────────────────
 # Overlay: 用源码编译的 CUPS 二进制覆盖 apt 版
@@ -316,12 +340,12 @@ COPY scripts/driver/driver-install.sh /usr/local/bin/driver-install
 COPY scripts/driver/driver-list.sh /usr/local/bin/driver-list
 COPY scripts/driver/driver-remove.sh /usr/local/bin/driver-remove
 COPY scripts/driver/restore-drivers.sh /usr/local/bin/restore-drivers
-RUN chmod +x /usr/local/bin/driver-* /usr/local/bin/restore-drivers /opt/cups-drivers/scripts/*.sh
-
-# Create base snapshot for driver diff (used by driver-list to detect installed drivers)
-RUN mkdir -p /opt/cups-base && \
-    find /usr/lib/cups /usr/share/cups /usr/share/ppd /lib/firmware \
-      -type f 2>/dev/null | sort > /opt/cups-base/filelist.txt
+# 预建 /opt/cups-drivers/data：driver-install 把驱动文件持久化到这里、driver-list 靠
+# 其下的 <name>/manifest.txt 判断驱动是否已装。正常部署会用 volume 挂载覆盖它，但不挂卷
+# 直接 `docker run` 时目录也得存在，驱动安装/列表才不会因缺目录而行为异常（此时数据随容器
+# 销毁而丢失，属预期行为）。
+RUN chmod +x /usr/local/bin/driver-* /usr/local/bin/restore-drivers /opt/cups-drivers/scripts/*.sh && \
+    mkdir -p /opt/cups-drivers/data
 
 # ────────────────────────────────────────────────────────────────
 # Copy application binaries from build stages
