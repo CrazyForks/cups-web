@@ -1,6 +1,7 @@
 .etc/
 .data
 .uploads
+.drivers
 
 bin/
 frontend/dist/
