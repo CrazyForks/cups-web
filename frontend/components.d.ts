@@ -35,7 +35,9 @@ declare module 'vue' {
     UPrintOptions: typeof import('./src/components/print/PrintOptions.vue')['default']
     UPrintPreview: typeof import('./src/components/print/PrintPreview.vue')['default']
     UPrintRecordList: typeof import('./src/components/print/PrintRecordList.vue')['default']
+    URadioGroup: typeof import('./node_modules/@nuxt/ui/dist/runtime/components/RadioGroup.vue')['default']
     USelect: typeof import('./node_modules/@nuxt/ui/dist/runtime/components/Select.vue')['default']
+    USkeleton: typeof import('./node_modules/@nuxt/ui/dist/runtime/components/Skeleton.vue')['default']
     UTable: typeof import('./node_modules/@nuxt/ui/dist/runtime/components/Table.vue')['default']
     UTooltip: typeof import('./node_modules/@nuxt/ui/dist/runtime/components/Tooltip.vue')['default']
   }

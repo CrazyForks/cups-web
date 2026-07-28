@@ -51,6 +51,31 @@ type DetectedPrinter struct {
 	Connection   string      `json:"connection"` // "usb", "network", "direct"
 	DriverMatch  *DriverMeta `json:"driverMatch"`
 	HasDriver    bool        `json:"hasDriver"` // CUPS already has a matching PPD
+
+	// 以下为 PPD 候选匹配引擎新增字段（全部 omitempty，保持向后兼容）。
+
+	// DeviceID 是原始 IEEE-1284 串（lpinfo 的 device-id 字段）。
+	// 历史实现解析出 MFG/MDL 后就丢弃了原串，但它是 cups-driverd 指纹匹配的唯一输入，
+	// 也是排障时的金矿——管理员截图就能看出设备自报了什么。
+	DeviceID string `json:"deviceId,omitempty"`
+	// MakeAndModel 是 lpinfo 的 make-and-model 原文，供人工核对。
+	MakeAndModel string `json:"makeAndModel,omitempty"`
+	// Info 是 lpinfo 的 info 字段。
+	Info string `json:"info,omitempty"`
+	// Location 是 lpinfo 的 location 字段，多机场景辨认设备用。
+	Location string `json:"location,omitempty"`
+	// Scheme 是 device-uri 的 scheme（usb / ipp / ipps / dnssd / socket / lpd）。
+	Scheme string `json:"scheme,omitempty"`
+	// DriverState 是四态驱动状态：ready / driverless / needsVendorDriver / unmatched。
+	DriverState string `json:"driverState"`
+	// TopCandidate 是本地打分的 Top-1 候选（detect 内联，零额外 fork）。
+	TopCandidate *PPDCandidate `json:"topCandidate,omitempty"`
+	// CandidateCount 是候选总数（含 generic 兜底）。
+	CandidateCount int `json:"candidateCount"`
+	// ExistingQueue 是该 device-uri 已有的 CUPS 队列名（lpstat -v 查出）。
+	ExistingQueue string `json:"existingQueue,omitempty"`
+	// SuggestedName 是去重后的建议队列名。
+	SuggestedName string `json:"suggestedName,omitempty"`
 }
 
 var driversRegistry = []DriverMeta{

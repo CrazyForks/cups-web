@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -359,6 +360,8 @@ func adminInstallDriverHandler(w http.ResponseWriter, r *http.Request) {
 		if err := runDriverCommand(ctx, logBuf, "/usr/local/bin/driver-install", name); err != nil {
 			return nil, fmt.Errorf("driver installation failed: %w", err)
 		}
+		// 驱动装完后 PPD 列表变了，必须失效缓存，否则紧接着的 detect/setup 会拿到旧列表。
+		invalidatePPDModels()
 		return map[string]any{"name": name}, nil
 	})
 	if job == nil {
@@ -391,6 +394,7 @@ func adminRemoveDriverHandler(w http.ResponseWriter, r *http.Request) {
 		if err := runDriverCommand(ctx, logBuf, "/usr/local/bin/driver-remove", name); err != nil {
 			return nil, fmt.Errorf("driver removal failed: %w", err)
 		}
+		invalidatePPDModels()
 		return map[string]any{"name": name}, nil
 	})
 	if job == nil {
@@ -405,24 +409,48 @@ func adminRemoveDriverHandler(w http.ResponseWriter, r *http.Request) {
 // ── 检测打印机 ─────────────────────────────────────────────────────────────────
 
 // GET /api/admin/drivers/detect — 检测已连接的打印机并推荐驱动。
+//
+// 改进点（相对历史实现）：
+//   - 独立超时 context（不再挂 r.Context()，网络扫描慢时不会被浏览器取消掐断）
+//   - 按 lpinfo caps 加 --timeout / --include-schemes 过滤噪声
+//   - 内联 Top-1 PPD 候选（纯本地打分，零额外 fork，首屏就能显示驱动名）
+//   - 四态 driverState（ready / driverless / needsVendorDriver / unmatched）
+//   - lpstat -v 一次填 existingQueue / suggestedName
+//
+// detect 绝不调 cups-driverd 委托、绝不做 IPP 探测——那是候选接口的事。
 func adminDetectPrintersHandler(w http.ResponseWriter, r *http.Request) {
-	// 必须用长格式 lpinfo -l -v：短格式 lpinfo -v 每行只有 "<class> <uri>" 两列，
-	// 根本没有厂商型号，历史代码按 4 列解析导致型号恒为空 → 驱动匹配与 PPD 查找全线失真。
-	cmd := exec.CommandContext(r.Context(), "lpinfo", "-l", "-v")
-	output, err := cmd.Output()
+	// 独立超时：lpinfo -l -v 在网络打印机多时可能要十几秒（DNS-SD/SNMP 扫描），
+	// 挂 r.Context() 会被 120s WriteTimeout 或浏览器取消掐断。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cancel()
+
+	// 按能力探测结果组装 lpinfo 参数。
+	args := []string{"-l", "-v"}
+	caps := lpinfoCapabilities(ctx)
+	if caps.Timeout {
+		args = append(args, "--timeout", "10")
+	}
+	if caps.Schemes {
+		args = append(args, "--include-schemes", "usb,ipp,ipps,dnssd,socket,lpd,hp,snmp")
+	}
+
+	output, err := exec.CommandContext(ctx, "lpinfo", args...).Output()
 	if err != nil {
-		log.Printf("[driver-detect] lpinfo -l -v failed: %v", err)
+		log.Printf("[driver-detect] lpinfo %v failed: %v", args, err)
 		writeJSONError(w, http.StatusInternalServerError, "failed to detect printers")
 		return
 	}
 
 	printers := parseLpinfoDevices(string(output))
 
-	// lpinfo -m 输出可能有几千行，整个检测过程只取一次，避免每台设备都 fork 一个进程。
-	models, err := listCUPSModels(r.Context())
-	if err != nil {
-		log.Printf("[driver-detect] lpinfo -m failed (降级为无 PPD 信息): %v", err)
+	// PPD 列表走缓存（不再每台设备 fork 一次 lpinfo -m）。
+	entries, entriesErr := cachedPPDEntries(ctx)
+	if entriesErr != nil {
+		log.Printf("[driver-detect] lpinfo -m failed (降级为无 PPD 信息): %v", entriesErr)
 	}
+
+	// 队列快照：一次 lpstat -v 拿到所有已有队列的 device-uri 映射。
+	queues, _ := listExistingQueues(ctx)
 
 	for i := range printers {
 		p := &printers[i]
@@ -430,10 +458,139 @@ func adminDetectPrintersHandler(w http.ResponseWriter, r *http.Request) {
 		if match := matchDriverForPrinter(searchStr); match != nil {
 			p.DriverMatch = match
 		}
-		p.HasDriver = checkHasDriver(models, p.Manufacturer, p.Model)
+
+		// 本地打分 Top-1（纯内存操作，零 fork）。
+		if entriesErr == nil {
+			in := MatchInput{
+				Manufacturer: p.Manufacturer,
+				Model:        p.Model,
+				DeviceID:     p.DeviceID,
+				Scheme:       p.Scheme,
+				PreferLang:   "zh",
+			}
+			cands := ScorePPDCandidates(entries, in, 5)
+			p.CandidateCount = len(cands)
+			if len(cands) > 0 {
+				p.TopCandidate = &cands[0]
+			}
+		}
+
+		// 四态 driverState。
+		best := bestPPDFromCandidates(nil) // 先用空列表算
+		if p.TopCandidate != nil {
+			best = bestPPDFromCandidates([]PPDCandidate{*p.TopCandidate})
+		}
+		switch {
+		case best != "":
+			p.DriverState = "ready"
+			p.HasDriver = true
+		case p.DriverMatch != nil:
+			p.DriverState = "needsVendorDriver"
+		case p.Scheme != "" && driverlessSchemes[p.Scheme]:
+			p.DriverState = "driverless"
+			p.HasDriver = true
+		default:
+			p.DriverState = "unmatched"
+		}
+
+		// 已有队列与建议名。
+		if q := findQueueByURI(queues, p.DeviceURI); q != "" {
+			p.ExistingQueue = q
+		}
+		base := sanitizePrinterName(p.Model)
+		if base == "" {
+			base = sanitizePrinterName(p.Manufacturer)
+		}
+		if base == "" {
+			base = "Printer"
+		}
+		p.SuggestedName, _ = uniquePrinterNameChecked(base, queues)
 	}
 
 	writeJSON(w, printers)
+}
+
+// ── 候选 PPD 查询 ──────────────────────────────────────────────────────────────
+
+// ppdQuerySem 是候选查询的轻量并发闸。
+// 候选查询不占 startDriverJob 的全局单飞锁（否则"看候选"和"装驱动"互斥），
+// 但每次查询可能 fork cups-driverd（秒级），需要限制并发防 fork 风暴。
+var ppdQuerySem = make(chan struct{}, 4)
+
+// GET /api/admin/drivers/ppds?deviceUri=&deviceId=&manufacturer=&model=&limit=8
+//
+// 返回某台打印机的 PPD 候选列表（Top-N），含 driverless 可用性与排障用的 matcher 字段。
+// 不走后台 job：最坏 15s（本地 <10ms + driverd ≤8s + IPP ≤5s）远低于 120s WriteTimeout，
+// 而走 job 会踩全局单飞锁与安装互斥，并让前端多两次往返。
+func adminListPPDCandidatesHandler(w http.ResponseWriter, r *http.Request) {
+	// 并发闸：满了直接 429，防止管理员连点导致 fork 风暴。
+	select {
+	case ppdQuerySem <- struct{}{}:
+		defer func() { <-ppdQuerySem }()
+	default:
+		writeJSONError(w, http.StatusTooManyRequests, "候选查询繁忙，请稍后重试")
+		return
+	}
+
+	q := r.URL.Query()
+	deviceURI := strings.TrimSpace(q.Get("deviceUri"))
+	deviceID := strings.TrimSpace(q.Get("deviceId"))
+	manufacturer := strings.TrimSpace(q.Get("manufacturer"))
+	model := strings.TrimSpace(q.Get("model"))
+	limit := 8
+	if v := q.Get("limit"); v != "" {
+		if n, err := fmt.Sscanf(v, "%d", &limit); n != 1 || err != nil || limit < 1 || limit > 20 {
+			limit = 8
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 20*time.Second)
+	defer cancel()
+
+	cands, dlInfo, driverdMatched, err := matchPPDCandidates(ctx, nil,
+		manufacturer, model, deviceID, deviceURI, true, limit)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("PPD 匹配失败: %v", err))
+		return
+	}
+
+	// 队列快照。
+	queues, _ := listExistingQueues(ctx)
+	existingQueue := findQueueByURI(queues, deviceURI)
+	base := sanitizePrinterName(model)
+	if base == "" {
+		base = sanitizePrinterName(manufacturer)
+	}
+	if base == "" {
+		base = "Printer"
+	}
+	suggestedName, _ := uniquePrinterNameChecked(base, queues)
+
+	// 能力探测结果（排障用）。
+	caps := lpinfoCapabilities(ctx)
+
+	writeJSON(w, map[string]any{
+		"deviceUri":     deviceURI,
+		"manufacturer":  manufacturer,
+		"model":         model,
+		"suggestedName": suggestedName,
+		"existingQueue": existingQueue,
+		"driverless":    dlInfo,
+		"candidates":    cands,
+		"allowRaw":      true,
+		"matcher": map[string]any{
+			"driverd":        caps.DeviceID || caps.MakeAndModel,
+			"driverdMatched": driverdMatched,
+			"caps": map[string]bool{
+				"deviceId":     caps.DeviceID,
+				"makeAndModel": caps.MakeAndModel,
+				"language":     caps.Language,
+				"timeout":      caps.Timeout,
+			},
+			"modelLines":      ppdModels.lines,
+			"cacheAgeSeconds": ppdCacheAgeSeconds(),
+		},
+	})
 }
 
 // parseLpinfoDevices 解析 `lpinfo -l -v` 的长格式输出。
@@ -524,7 +681,20 @@ func buildDetectedPrinter(fields map[string]string) (DetectedPrinter, bool) {
 		Manufacturer: manufacturer,
 		Model:        model,
 		Connection:   connection,
+		DeviceID:     fields["device-id"],
+		MakeAndModel: fields["make-and-model"],
+		Info:         fields["info"],
+		Location:     fields["location"],
+		Scheme:       uriScheme(uri),
 	}, true
+}
+
+// uriScheme 提取 URI 的 scheme 部分（小写），如 "usb"、"ipp"、"dnssd"。
+func uriScheme(uri string) string {
+	if idx := strings.Index(uri, "://"); idx > 0 {
+		return strings.ToLower(uri[:idx])
+	}
+	return ""
 }
 
 // normalizeDeviceClass 把 lpinfo 的 class 与 URI scheme 归一成 usb / network / 原值。
@@ -588,14 +758,24 @@ func parseDeviceID(id string) (manufacturer, model string) {
 // ── 一键设置打印机 ─────────────────────────────────────────────────────────────
 
 // POST /api/admin/drivers/setup — 安装驱动 + lpadmin 添加打印机，异步执行返回 202 + jobId。
-// 字段名以 /detect 的响应为准（deviceUri），历史前端发的 {uri, driverMatch, installDriver}
-// 与后端完全不匹配，导致这条主路径 100% 返回 400。
+//
+// 请求体：
+//
+//	{deviceUri, driverName?, manufacturer?, model?, deviceId?,
+//	 ppdUri?, printerName?, allowRaw?}
+//
+// ppdUri 三态："" = 自动匹配；"everywhere" = IPP Everywhere；"__raw__" = 显式 raw 队列；
+// 其他 = 显式指定 ppd-name（必须存在于 lpinfo -m 的输出里）。
 func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		DeviceURI    string `json:"deviceUri"`
 		DriverName   string `json:"driverName"`
 		Manufacturer string `json:"manufacturer"`
 		Model        string `json:"model"`
+		DeviceID     string `json:"deviceId"`
+		PPDURI       string `json:"ppdUri"`
+		PrinterName  string `json:"printerName"`
+		AllowRaw     bool   `json:"allowRaw"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -620,11 +800,32 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// handler 层预校验 ppdUri（job 内会再复核一次）。
+	ppdURI := strings.TrimSpace(payload.PPDURI)
+	if ppdURI != "" && ppdURI != "everywhere" && ppdURI != "__raw__" {
+		if err := ValidatePPDNameSyntax(ppdURI); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("ppdUri 不合法: %v", err))
+			return
+		}
+	}
+	if ppdURI == "__raw__" && !payload.AllowRaw {
+		writeJSONError(w, http.StatusBadRequest, "建立 raw 队列需要显式设置 allowRaw=true")
+		return
+	}
+	if ppdURI == "everywhere" {
+		scheme := uriScheme(payload.DeviceURI)
+		if !driverlessSchemes[scheme] {
+			writeJSONError(w, http.StatusBadRequest,
+				fmt.Sprintf("%s 连接不支持 IPP Everywhere（仅 IPP 连接可用）", scheme))
+			return
+		}
+	}
+
 	req := payload
 	job, busyID := startDriverJob("setup", req.DriverName, func(ctx context.Context, logBuf *safeBuffer) (map[string]any, error) {
 		driverInstalled := false
 
-		// 第 1 步：驱动未安装时先装（manifest.txt 是 driver-install 的安装标记）。
+		// 第 1 步：驱动未安装时先装。
 		if req.DriverName != "" {
 			manifestPath := filepath.Join(driversDataDir, req.DriverName, "manifest.txt")
 			if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
@@ -632,43 +833,138 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 					return nil, fmt.Errorf("driver installation failed: %w", err)
 				}
 				driverInstalled = true
+				invalidatePPDModels()
+				refreshPPDEntriesAfterInstall(ctx, logBuf)
 			} else {
 				fmt.Fprintf(logBuf, "驱动 %s 已安装，跳过安装步骤\n", req.DriverName)
 			}
 		}
 
-		// 第 2 步：确定厂商/型号。URI 只有 usb:// 才带厂商型号，
-		// 网络打印机解析不出来时用请求里带来的（来自 /detect 的 lpinfo make-and-model）补全。
-		manufacturer, model := parseDeviceURI(req.DeviceURI)
-		if strings.TrimSpace(model) == "" {
-			manufacturer, model = strings.TrimSpace(req.Manufacturer), strings.TrimSpace(req.Model)
+		// 第 2 步：确定厂商/型号（来源优先级修正）。
+		manufacturer, model := strings.TrimSpace(req.Manufacturer), strings.TrimSpace(req.Model)
+		if model == "" {
+			manufacturer, model = parseDeviceID(req.DeviceID)
+		}
+		if model == "" {
+			manufacturer, model = parseDeviceURI(req.DeviceURI)
 		}
 
-		// 第 3 步：挑 PPD。挑不到就不传 -m，让 CUPS 走 driverless/IPP Everywhere，
-		// 这是安全的降级——比硬套一个无关 PPD 好得多。
-		ppdURI := findBestPPD(ctx, manufacturer, model)
-		if ppdURI == "" {
-			fmt.Fprintf(logBuf, "未找到匹配的 PPD，将由 CUPS 自动选择（driverless / IPP Everywhere）\n")
-		} else {
-			fmt.Fprintf(logBuf, "使用 PPD: %s\n", ppdURI)
+		// 第 3 步：决定 -m 参数（三态决策树）。
+		ppdURI := strings.TrimSpace(req.PPDURI)
+		decision := "auto-top1"
+		var cands []PPDCandidate
+		var dlInfo driverlessInfo
+
+		switch {
+		case ppdURI == "__raw__":
+			// a) 显式 raw：不传 -m，大字告警。
+			fmt.Fprintf(logBuf, "⚠⚠⚠ 建立 raw 队列（无驱动）：将无法选择纸盒/双面，多数打印机会打出乱码 ⚠⚠⚠\n")
+			decision = "raw-explicit"
+
+		case ppdURI == "everywhere":
+			// b) 显式 IPP Everywhere。
+			decision = "everywhere"
+			fmt.Fprintf(logBuf, "使用 IPP Everywhere（-m everywhere）\n")
+
+		case ppdURI != "":
+			// c) 显式 ppd-name：job 内复核语义白名单。
+			entries, err := cachedPPDEntries(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("获取 PPD 列表失败: %w", err)
+			}
+			found := false
+			for i := range entries {
+				if entries[i].Name == ppdURI {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("指定的驱动不存在: %s（请重新扫描后再选）", ppdURI)
+			}
+			decision = "explicit"
+			fmt.Fprintf(logBuf, "使用管理员指定的 PPD: %s\n", ppdURI)
+
+		default:
+			// d) 自动匹配。
+			var matchErr error
+			cands, dlInfo, _, matchErr = matchPPDCandidates(ctx, logBuf,
+				manufacturer, model, req.DeviceID, req.DeviceURI, true, 5)
+			if matchErr != nil {
+				fmt.Fprintf(logBuf, "PPD 匹配出错: %v\n", matchErr)
+			}
+			ppdURI = bestPPDFromCandidates(cands)
+			if ppdURI != "" {
+				decision = "auto-top1"
+				fmt.Fprintf(logBuf, "自动匹配 PPD: %s\n", ppdURI)
+			} else if dlInfo.Available {
+				ppdURI = "everywhere"
+				decision = "everywhere-fallback"
+				fmt.Fprintf(logBuf, "无型号匹配，降级使用 IPP Everywhere（-m everywhere）\n")
+			} else {
+				// d3) 一个候选都没有 → 报错，绝不静默建 raw。
+				fmt.Fprintf(logBuf, "device-id: %s\n", req.DeviceID)
+				fmt.Fprintf(logBuf, "解析结果: manufacturer=%q model=%q\n", manufacturer, model)
+				return nil, fmt.Errorf(
+					"未能为该打印机匹配到驱动。请在候选列表中手动选择，或确认建立 raw 队列（无驱动，将无法选择纸盒/双面，多数打印机会打出乱码）")
+			}
 		}
 
-		// 第 4 步：生成打印机名。
-		printerName := sanitizePrinterName(model)
-		if printerName == "" {
-			printerName = sanitizePrinterName(manufacturer)
+		// 第 4 步：队列名（去重 + 同 URI 拒绝覆盖）。
+		queues, _ := listExistingQueues(ctx)
+		if existing := findQueueByURI(queues, req.DeviceURI); existing != "" {
+			return nil, fmt.Errorf("该设备已添加为队列 %s，如需重新配置请先删除该队列", existing)
 		}
-		if printerName == "" {
-			printerName = "Printer"
+		base := req.PrinterName
+		if base == "" {
+			base = sanitizePrinterName(model)
+		}
+		if base == "" {
+			base = sanitizePrinterName(manufacturer)
+		}
+		if base == "" {
+			base = "Printer"
+		}
+		printerName, isNew, nameErr := func() (string, bool, error) {
+			name, err := uniquePrinterNameChecked(base, queues)
+			if err != nil {
+				return "", false, err
+			}
+			_, taken := queues[name]
+			return name, !taken, nil
+		}()
+		if nameErr != nil {
+			return nil, nameErr
+		}
+		renamedFrom := ""
+		if !isNew {
+			renamedFrom = base
 		}
 
 		// 第 5 步：lpadmin 添加并启用。
 		args := []string{"-p", printerName, "-E", "-v", req.DeviceURI}
-		if ppdURI != "" {
+		expectPPD := ppdURI != "" && ppdURI != "__raw__"
+		if expectPPD {
 			args = append(args, "-m", ppdURI)
 		}
 		if err := runDriverCommand(ctx, logBuf, "lpadmin", args...); err != nil {
-			return nil, fmt.Errorf("failed to add printer: %w", err)
+			// -m everywhere 失败时自动降级重试一次 Top-1（lpadmin 失败时队列不会被创建，重试无副作用）。
+			if ppdURI == "everywhere" && len(cands) > 0 {
+				fallback := bestPPDFromCandidates(cands)
+				if fallback != "" {
+					fmt.Fprintf(logBuf, "everywhere 失败，降级重试 PPD: %s\n", fallback)
+					args2 := []string{"-p", printerName, "-E", "-v", req.DeviceURI, "-m", fallback}
+					if err2 := runDriverCommand(ctx, logBuf, "lpadmin", args2...); err2 == nil {
+						ppdURI = fallback
+						decision = "auto-top1"
+						expectPPD = true
+						err = nil
+					}
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to add printer: %w", err)
+			}
 		}
 
 		// 第 6 步：默认纸张设为 A4（国内场景），失败不影响整体成功。
@@ -676,11 +972,38 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(logBuf, "设置 A4 默认纸张失败（不影响使用）: %v\n", err)
 		}
 
-		return map[string]any{
+		// 第 7 步：验证队列是否真正生效。
+		optionCount, mediaSourceCount, warnings := verifyPrinterQueue(ctx, logBuf, printerName, expectPPD)
+		if expectPPD && optionCount == 0 {
+			// PPD 没真正生效（"假成功 raw 队列"）→ 回滚。
+			if isNew {
+				fmt.Fprintf(logBuf, "PPD 未生效，回滚删除队列 %s\n", printerName)
+				runDriverCommand(ctx, logBuf, "lpadmin", "-x", printerName)
+			}
+			return nil, fmt.Errorf("PPD 未真正生效（lpoptions 输出为空），队列可能是 raw 模式")
+		}
+		for _, w := range warnings {
+			fmt.Fprintf(logBuf, "⚠ %s\n", w)
+		}
+
+		result := map[string]any{
 			"printerName":     printerName,
 			"driverInstalled": driverInstalled,
 			"ppdUsed":         ppdURI,
-		}, nil
+			"driverless":      ppdURI == "everywhere",
+			"raw":             ppdURI == "__raw__" || ppdURI == "",
+			"decision":        decision,
+			"verify": map[string]any{
+				"ppdEffective":     optionCount > 0,
+				"optionCount":      optionCount,
+				"mediaSourceCount": mediaSourceCount,
+				"warnings":         warnings,
+			},
+		}
+		if renamedFrom != "" {
+			result["renamedFrom"] = renamedFrom
+		}
+		return result, nil
 	})
 	if job == nil {
 		writeDriverJobBusy(w, busyID)
@@ -754,6 +1077,7 @@ func adminUploadDriverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("[driver-upload] 已安装 PPD: %s (user=%s)", filename, username)
+		invalidatePPDModels()
 		writeJSON(w, map[string]any{"ok": true, "type": "ppd", "filename": filename})
 
 	case ".deb":
@@ -788,6 +1112,7 @@ func adminUploadDriverHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("package installation failed: %v", err))
 			return
 		}
+		invalidatePPDModels()
 
 		// 归档原件，至少让用户在列表里看得到"装过什么"；
 		// 归档失败不影响本次安装成功，只是重启后无从追溯，故降级为警告。
@@ -957,84 +1282,55 @@ func sessionUsername(r *http.Request) string {
 }
 
 // parseDeviceURI extracts manufacturer and model from a CUPS device URI.
+//
+// 不用 url.Parse：CUPS 的 usb:// URI 在 host 段用 %20 表示空格（"usb://Canon%20Inc./LBP2900"），
+// 这违反 RFC 3986（host 段只允许 IPv6 用百分号编码），url.Parse 会直接报错。
+// 所以手动按 scheme 拆分，对每段做 url.PathUnescape。
+//
+// 支持的 scheme：
+//   - usb://Vendor/Model?serial=XXX
+//   - dnssd://Instance%20Name._ipp._tcp.local/?uuid=...
+//
+// 明确不猜的 scheme：socket:// / lpd:// / ipp://<主机名> 的 host 是 IP 或主机名，
+// 不含可靠型号信息。硬猜会把 "192.168.1.50" 当型号去匹配 PPD，比空更糟。
 func parseDeviceURI(uri string) (manufacturer, model string) {
-	// Parse URIs like usb://Canon/LBP2900?serial=XXX
-	if strings.HasPrefix(uri, "usb://") {
-		path := strings.TrimPrefix(uri, "usb://")
-		// Remove query string.
-		if idx := strings.Index(path, "?"); idx >= 0 {
-			path = path[:idx]
+	scheme, rest, ok := strings.Cut(uri, "://")
+	if !ok {
+		return "", ""
+	}
+	switch strings.ToLower(scheme) {
+	case "usb":
+		// 去掉 query string。
+		if idx := strings.Index(rest, "?"); idx >= 0 {
+			rest = rest[:idx]
 		}
-		parts := strings.SplitN(path, "/", 2)
+		parts := strings.SplitN(rest, "/", 2)
 		if len(parts) >= 1 {
-			manufacturer = strings.ReplaceAll(parts[0], "%20", " ")
+			manufacturer, _ = url.PathUnescape(parts[0])
 		}
 		if len(parts) >= 2 {
-			model = strings.ReplaceAll(parts[1], "%20", " ")
+			model, _ = url.PathUnescape(parts[1])
 		}
+	case "dnssd":
+		// 去掉 query string 和路径。
+		if idx := strings.IndexAny(rest, "/?"); idx >= 0 {
+			rest = rest[:idx]
+		}
+		host, _ := url.PathUnescape(rest)
+		// 剥掉 DNS-SD service type 尾缀。
+		for _, suffix := range []string{
+			"._ipp._tcp.local", "._ipps._tcp.local",
+			"._printer._tcp.local", "._pdl-datastream._tcp.local",
+			"._scanner._tcp.local",
+		} {
+			if idx := strings.Index(strings.ToLower(host), suffix); idx > 0 {
+				host = host[:idx]
+				break
+			}
+		}
+		manufacturer, model = splitMakeAndModel(host)
 	}
 	return
-}
-
-// listCUPSModels 返回 `lpinfo -m` 的输出行（每行 "<ppd-uri> <make-and-model>"）。
-func listCUPSModels(ctx context.Context) ([]string, error) {
-	output, err := exec.CommandContext(ctx, "lpinfo", "-m").Output()
-	if err != nil {
-		return nil, err
-	}
-	return strings.Split(string(output), "\n"), nil
-}
-
-// checkHasDriver 判断 CUPS 里是否已存在匹配该打印机的 PPD。
-// 直接复用 findBestPPDFromModels：「能挑出 PPD」才是「已就绪」的定义，
-// 两处口径一致才不会出现"UI 显示已就绪、lpadmin 却挑不出 PPD"的割裂。
-func checkHasDriver(models []string, manufacturer, model string) bool {
-	return findBestPPDFromModels(models, manufacturer, model) != ""
-}
-
-// findBestPPD 查询 CUPS 并挑出最匹配的 PPD URI，挑不到返回空串。
-func findBestPPD(ctx context.Context, manufacturer, model string) string {
-	models, err := listCUPSModels(ctx)
-	if err != nil {
-		return ""
-	}
-	return findBestPPDFromModels(models, manufacturer, model)
-}
-
-// findBestPPDFromModels 在 `lpinfo -m` 的行集合里挑 PPD：
-// 先按「厂商 + 型号」整串匹配，退一步只匹配型号，都不中就返回空串。
-//
-// 型号解析失败时必须短路：用空串（或单空格）去 strings.Contains 恒为 true，
-// 会把 lpinfo -m 的第一条 PPD 随机套到打印机上——这是历史实现最危险的缺陷。
-func findBestPPDFromModels(models []string, manufacturer, model string) string {
-	model = strings.TrimSpace(model)
-	// 单字符型号（"L" 之类的解析残渣）会命中海量无关 PPD，同样视为无效。
-	if len(model) < 2 {
-		return ""
-	}
-
-	full := strings.ToLower(strings.TrimSpace(strings.TrimSpace(manufacturer) + " " + model))
-	only := strings.ToLower(model)
-
-	fallback := ""
-	for _, line := range models {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		ppd, desc, ok := strings.Cut(line, " ")
-		if !ok || ppd == "" {
-			continue
-		}
-		desc = strings.ToLower(desc)
-		if strings.Contains(desc, full) {
-			return ppd
-		}
-		if fallback == "" && strings.Contains(desc, only) {
-			fallback = ppd
-		}
-	}
-	return fallback
 }
 
 // sanitizePrinterName converts a model string into a valid CUPS printer name.

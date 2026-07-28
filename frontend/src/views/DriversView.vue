@@ -37,40 +37,80 @@
               <div class="text-xs text-muted truncate max-w-xs">{{ row.original.deviceUri }}</div>
             </template>
             <template #driverStatus-cell="{ row }">
-              <UBadge v-if="row.original.hasDriver" color="success" size="sm">已就绪</UBadge>
-              <UBadge v-else-if="row.original.driverMatch" color="warning" size="sm">
-                推荐安装: {{ row.original.driverMatch.displayName }}
-              </UBadge>
-              <UBadge v-else color="neutral" size="sm">未知</UBadge>
+              <div class="flex items-center gap-1 flex-wrap">
+                <UBadge v-if="row.original.existingQueue" color="success" variant="subtle" size="sm">
+                  已添加: {{ row.original.existingQueue }}
+                </UBadge>
+                <UBadge v-if="row.original.driverState === 'ready'" color="success" size="sm">
+                  <UTooltip :text="row.original.topCandidate?.makeAndModel || ''">驱动已就绪</UTooltip>
+                </UBadge>
+                <UBadge v-else-if="row.original.driverState === 'driverless'" color="primary" size="sm">
+                  免驱动可用 (IPP)
+                </UBadge>
+                <UBadge v-else-if="row.original.driverState === 'needsVendorDriver'" color="warning" size="sm">
+                  需安装: {{ row.original.driverMatch?.displayName || '驱动' }}
+                </UBadge>
+                <UBadge v-else-if="row.original.driverState === 'unmatched'" color="error" variant="subtle" size="sm">
+                  未匹配到驱动
+                </UBadge>
+                <!-- 兼容旧后端（无 driverState 字段时退回三态） -->
+                <template v-if="!row.original.driverState">
+                  <UBadge v-if="row.original.hasDriver" color="success" size="sm">已就绪</UBadge>
+                  <UBadge v-else-if="row.original.driverMatch" color="warning" size="sm">
+                    推荐安装: {{ row.original.driverMatch.displayName }}
+                  </UBadge>
+                  <UBadge v-else color="neutral" size="sm">未知</UBadge>
+                </template>
+              </div>
             </template>
             <template #actions-cell="{ row }">
-              <!-- 推荐的驱动在当前架构上不可用时，不给「一键安装」按钮，避免必然失败的点击 -->
+              <!-- 已添加队列：禁用操作 -->
+              <UTooltip v-if="row.original.existingQueue" text="如需重新配置，请先在 CUPS 中删除该队列">
+                <UButton size="sm" icon="i-lucide-check" color="neutral" variant="outline" disabled>
+                  已添加
+                </UButton>
+              </UTooltip>
+              <!-- 推荐的驱动在当前架构上不可用 -->
               <UTooltip
-                v-if="row.original.driverMatch && !row.original.hasDriver && !archSupported(row.original.driverMatch.arch)"
+                v-else-if="row.original.driverMatch && !row.original.hasDriver && !archSupported(row.original.driverMatch.arch)"
                 :text="`当前架构 ${currentArch} 不支持该驱动`"
               >
                 <UButton size="sm" icon="i-lucide-ban" color="neutral" variant="outline" disabled>
                   架构不支持
                 </UButton>
               </UTooltip>
+              <!-- 需安装厂商驱动 -->
               <UButton
                 v-else-if="row.original.driverMatch && !row.original.hasDriver"
                 size="sm"
                 icon="i-lucide-download"
                 :loading="settingUp === row.original.deviceUri"
                 :disabled="busy"
-                @click="setupPrinter(row.original)"
+                @click="openPPDModal(row.original)"
               >
                 一键安装并添加
               </UButton>
+              <!-- 未匹配到驱动：手动选择 -->
               <UButton
-                v-else-if="row.original.hasDriver"
+                v-else-if="row.original.driverState === 'unmatched'"
+                size="sm"
+                variant="outline"
+                icon="i-lucide-search"
+                :loading="settingUp === row.original.deviceUri"
+                :disabled="busy"
+                @click="openPPDModal(row.original)"
+              >
+                手动选择驱动
+              </UButton>
+              <!-- 已就绪 / driverless：直接添加 -->
+              <UButton
+                v-else
                 size="sm"
                 variant="outline"
                 icon="i-lucide-plus"
                 :loading="settingUp === row.original.deviceUri"
                 :disabled="busy"
-                @click="setupPrinter(row.original)"
+                @click="openPPDModal(row.original)"
               >
                 添加打印机
               </UButton>
@@ -281,6 +321,127 @@
         </div>
       </template>
     </UModal>
+
+    <!-- PPD 候选选择弹窗 -->
+    <UModal v-model:open="showPPDModal" :ui="{ width: 'max-w-lg' }">
+      <template #content>
+        <div class="p-6 space-y-4">
+          <h3 class="text-lg font-semibold">选择驱动</h3>
+          <!-- 设备摘要 -->
+          <div class="text-sm">
+            <div class="font-medium">{{ printerLabel(ppdModalPrinter) }}</div>
+            <div class="text-xs text-muted truncate">{{ ppdModalPrinter?.deviceUri }}</div>
+            <details v-if="ppdModalPrinter?.deviceId" class="mt-1">
+              <summary class="text-xs text-muted cursor-pointer">Device ID（排障用）</summary>
+              <code class="text-xs break-all">{{ ppdModalPrinter.deviceId }}</code>
+            </details>
+          </div>
+
+          <!-- 已有队列警告 -->
+          <UAlert
+            v-if="ppdModalData?.existingQueue"
+            color="warning"
+            icon="i-lucide-alert-triangle"
+            :title="`该设备已添加为队列 ${ppdModalData.existingQueue}，请先删除后再添加`"
+          />
+
+          <!-- 候选查询失败降级 -->
+          <UAlert
+            v-if="ppdModalError"
+            color="warning"
+            icon="i-lucide-alert-triangle"
+            title="候选查询失败，将由服务端自动匹配"
+          />
+
+          <!-- 候选加载中 -->
+          <div v-if="ppdModalLoading" class="space-y-2">
+            <USkeleton v-for="i in 3" :key="i" class="h-12 w-full" />
+          </div>
+
+          <!-- 候选列表 -->
+          <div v-else-if="ppdModalCandidates.length" class="space-y-1">
+            <p class="text-xs text-muted">
+              完全匹配 = 厂商与型号完全一致；可能匹配 = 型号部分一致，建议先试打一页；通用 = 能打但纸盒/双面等功能可能缺失
+            </p>
+            <URadioGroup v-model="selectedPPD" :items="ppdRadioItems">
+              <template #label="{ item }">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span>{{ item.label }}</span>
+                  <UBadge v-if="item.raw?.recommended" color="primary" size="xs">推荐</UBadge>
+                  <UBadge
+                    :color="item.raw?.confidence === 'high' ? 'success' : item.raw?.confidence === 'medium' ? 'warning' : 'neutral'"
+                    size="xs"
+                  >
+                    {{ item.raw?.confidence === 'high' ? '完全匹配' : item.raw?.confidence === 'medium' ? '可能匹配' : '通用/兜底' }}
+                  </UBadge>
+                  <UBadge v-if="item.raw?.driverdRank >= 1" color="primary" variant="subtle" size="xs">CUPS 推荐</UBadge>
+                </div>
+                <div class="text-xs text-muted">{{ item.raw?.reason }} · {{ item.raw?.makeAndModel }}</div>
+              </template>
+            </URadioGroup>
+
+            <!-- IPP Everywhere 选项 -->
+            <div class="border-t pt-2 mt-2">
+              <UTooltip
+                v-if="!ppdModalData?.driverless?.available"
+                :text="ppdModalData?.driverless?.reason || '不支持'"
+              >
+                <div class="opacity-50 cursor-not-allowed text-sm">
+                  <input type="radio" disabled class="mr-2" />免驱动 IPP Everywhere
+                </div>
+              </UTooltip>
+              <label v-else class="flex items-center gap-2 text-sm cursor-pointer">
+                <input
+                  type="radio"
+                  :checked="selectedPPD === 'everywhere'"
+                  @change="selectedPPD = 'everywhere'"
+                />
+                免驱动 IPP Everywhere（由打印机自报能力）
+              </label>
+            </div>
+
+            <!-- 高级选项：raw 队列 -->
+            <details class="border-t pt-2 mt-2">
+              <summary class="text-xs text-muted cursor-pointer">高级选项</summary>
+              <label class="flex items-center gap-2 text-sm cursor-pointer mt-1">
+                <input
+                  type="radio"
+                  :checked="selectedPPD === '__raw__'"
+                  @change="selectedPPD = '__raw__'"
+                />
+                不使用驱动（raw 队列）
+              </label>
+              <UAlert
+                v-if="selectedPPD === '__raw__'"
+                color="error"
+                icon="i-lucide-alert-triangle"
+                title="将无法选择纸盒/双面，多数打印机会打出乱码"
+                description="仅在你确知打印机能直接解析 PDF/PostScript 时使用"
+                class="mt-2"
+              />
+            </details>
+          </div>
+
+          <!-- 队列名 -->
+          <div v-if="!ppdModalData?.existingQueue">
+            <label class="text-sm font-medium">队列名</label>
+            <UInput v-model="ppdQueueName" class="mt-1" />
+          </div>
+
+          <div class="flex justify-end gap-2">
+            <UButton variant="ghost" @click="showPPDModal = false">取消</UButton>
+            <UButton
+              color="primary"
+              :disabled="!!ppdModalData?.existingQueue || busy"
+              :loading="settingUp === ppdModalPrinter?.deviceUri"
+              @click="submitPPDSelection"
+            >
+              {{ ppdModalError ? '仍然继续（自动）' : '确认并添加' }}
+            </UButton>
+          </div>
+        </div>
+      </template>
+    </UModal>
   </div>
 </template>
 
@@ -387,6 +548,7 @@ async function detectPrinters() {
   scanning.value = true
   scanDone.value = false
   detected.value = []
+  candidatesByUri.value = {} // 重扫后旧候选一定失效
   try {
     const resp = await apiFetch('/api/admin/drivers/detect', {}, () => emit('logout'))
     if (!resp.ok) {
@@ -403,9 +565,8 @@ async function detectPrinters() {
   }
 }
 
-// 请求体字段名与后端 adminSetupPrinterHandler 严格对齐：
-// {deviceUri, driverName?, manufacturer?, model?}；deviceUri 来自 /detect 的响应字段。
-async function setupPrinter(printer) {
+// 请求体字段名与后端 adminSetupPrinterHandler 严格对齐。
+async function setupPrinter(printer, opts = {}) {
   settingUp.value = printer.deviceUri
   startJobPanel(`正在设置打印机 ${printerLabel(printer)}`)
   try {
@@ -413,7 +574,11 @@ async function setupPrinter(printer) {
       deviceUri: printer.deviceUri,
       driverName: printer.hasDriver ? '' : (printer.driverMatch?.name || ''),
       manufacturer: printer.manufacturer || '',
-      model: printer.model || ''
+      model: printer.model || '',
+      deviceId: printer.deviceId || '',
+      ppdUri: opts.ppdUri || '',
+      printerName: opts.printerName || '',
+      allowRaw: opts.allowRaw || false
     })
     finishJobPanel(true)
     toast.add({
@@ -429,6 +594,96 @@ async function setupPrinter(printer) {
   } finally {
     settingUp.value = null
   }
+}
+
+// --- PPD 候选选择 Modal ---
+const showPPDModal = ref(false)
+const ppdModalPrinter = ref(null)
+const ppdModalData = ref(null)
+const ppdModalLoading = ref(false)
+const ppdModalError = ref('')
+const ppdModalCandidates = ref([])
+const selectedPPD = ref('')
+const ppdQueueName = ref('')
+// 独立状态 map，不挂 row.original（detected 是 ref 数组，给元素加属性易踩响应性坑）
+const candidatesByUri = ref({})
+
+const ppdRadioItems = computed(() =>
+  ppdModalCandidates.value.map((c) => ({
+    value: c.ppd,
+    label: c.makeAndModel,
+    raw: c
+  }))
+)
+
+async function openPPDModal(printer) {
+  ppdModalPrinter.value = printer
+  ppdModalData.value = null
+  ppdModalCandidates.value = []
+  ppdModalError.value = ''
+  selectedPPD.value = ''
+  ppdQueueName.value = printer.suggestedName || ''
+  showPPDModal.value = true
+
+  // 同一 deviceUri 在本次扫描周期内只查一次
+  if (candidatesByUri.value[printer.deviceUri]) {
+    applyCandidateData(printer.deviceUri, candidatesByUri.value[printer.deviceUri])
+    return
+  }
+
+  ppdModalLoading.value = true
+  try {
+    const params = new URLSearchParams({
+      deviceUri: printer.deviceUri,
+      deviceId: printer.deviceId || '',
+      manufacturer: printer.manufacturer || '',
+      model: printer.model || '',
+      limit: '8'
+    })
+    const resp = await apiFetch(
+      `/api/admin/drivers/ppds?${params}`,
+      { signal: AbortSignal.timeout(20000) },
+      () => emit('logout')
+    )
+    if (!resp.ok) {
+      const msg = await readError(resp)
+      if (resp.status === 429) {
+        ppdModalError.value = '候选查询繁忙，请稍后重试'
+      } else {
+        ppdModalError.value = msg
+      }
+      return
+    }
+    const data = await resp.json()
+    candidatesByUri.value[printer.deviceUri] = data
+    applyCandidateData(printer.deviceUri, data)
+  } catch (e) {
+    ppdModalError.value = String(e)
+  } finally {
+    ppdModalLoading.value = false
+  }
+}
+
+function applyCandidateData(uri, data) {
+  ppdModalData.value = data
+  ppdModalCandidates.value = data.candidates || []
+  ppdQueueName.value = data.suggestedName || ppdQueueName.value
+  // 默认选中 recommended 项，没有则选第一条
+  const rec = ppdModalCandidates.value.find((c) => c.recommended)
+  selectedPPD.value = rec ? rec.ppd : (ppdModalCandidates.value[0]?.ppd || '')
+}
+
+async function submitPPDSelection() {
+  const printer = ppdModalPrinter.value
+  if (!printer) return
+  showPPDModal.value = false
+
+  const opts = {
+    ppdUri: ppdModalError.value ? '' : selectedPPD.value,
+    printerName: ppdQueueName.value,
+    allowRaw: selectedPPD.value === '__raw__'
+  }
+  await setupPrinter(printer, opts)
 }
 
 // --- 驱动管理 ---

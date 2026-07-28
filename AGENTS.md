@@ -135,6 +135,7 @@ cups-web/
 | POST | `/api/admin/drivers/install` | **异步**安装，`202` + `jobId` |
 | POST | `/api/admin/drivers/remove` | **异步**卸载，`202` + `jobId` |
 | GET | `/api/admin/drivers/detect` | 扫描打印机推荐驱动 |
+| GET | `/api/admin/drivers/ppds` | 候选 PPD 列表（`?deviceUri=&deviceId=&manufacturer=&model=&limit=8`） |
 | POST | `/api/admin/drivers/upload` | 上传 `.ppd` / `.deb`（**同步**，64MB 上限） |
 | POST | `/api/admin/drivers/setup` | **异步**一键设置，`202` + `jobId` |
 | GET | `/api/admin/drivers/jobs/{id}` | 轮询任务状态 |
@@ -291,9 +292,14 @@ KV 表。当前键：`retention_days`（`0` = 永久）、`session_hash_key` / `
 
 ### `lpinfo` 检测与一键设置
 
-- 用 `lpinfo -l -v` **长格式**（短格式无厂商型号）；过滤裸 backend 行（不含 `://`）与虚拟设备
-- 型号优先级：`make-and-model` → `device-id` MFG/MDL → `info` → URI 路径；空型号短路不传 `-m`（走 driverless）
-- `setup` 步骤：装驱动 → 确定厂商/型号 → `findBestPPD` → `lpadmin -p <name> -E -v <uri> [-m <ppd>]` → 默认 A4
+- 用 `lpinfo -l -v` **长格式**（短格式无厂商型号）；按 caps 加 `--timeout`/`--include-schemes`；独立超时 context（不挂 `r.Context()`）
+- 型号优先级（修正）：`req.Manufacturer/Model`（lpinfo make-and-model，最可信）→ `device-id` MFG/MDL → URI 路径。🚫 不要把 URI 解析排最前（usb URI 的厂商常是裸 "HP" 甚至 "Unknown"）
+- PPD 匹配走**打分引擎**（`ppd_match.go` 纯函数 + `ppd_query.go` 副作用层）：型号归一化 → 分层 tier 打分 → 来源偏好（custom > vendor > hplip > everywhere > foomatic > gutenprint > generic）→ cups-driverd 指纹加分 → 稳定排序 Top-N
+- `GET /api/admin/drivers/ppds` 返回候选列表（不走后台 job，不占单飞锁，并发闸 4）
+- `setup` 三态决策树：显式 `ppdUri` > `everywhere`（driverless）> 自动 Top-1 > **报错**（绝不静默建 raw）
+- ⚠️ **`lpadmin` 不传 `-m` 建的是 raw 队列（无 PPD），不是 IPP Everywhere。** 真正的 driverless 要显式 `-m everywhere`。raw 队列拿不到 PPD 选项 → `/api/printer-info` 的 `mediaSourceSupported` 为空 → 前端进纸盒下拉消失
+- 队列名去重（`uniquePrinterName`，`-2`…`-50` 后缀）；同 device-uri 已有队列时拒绝覆盖
+- `lpadmin` 后验证（`lpstat -p` + `lpoptions -l`），PPD 未生效时 `isNew` 队列回滚 `lpadmin -x`
 
 > 解析细节与历史翻车见 [docs/driver-management.md](docs/driver-management.md#lpinfo-检测格式假设与型号解析优先级)。
 
@@ -381,5 +387,7 @@ make docker-build   # AIO 镜像
 ## 🎯 常见开发任务 / 调试 / 代码风格
 
 > 新增 API、修改 DB、新增前端页面、新增文件类型、新增驱动的步骤模板，以及调试命令、Go/Vue 风格、Git 提交约定，见 [docs/conventions.md](docs/conventions.md)。
+>
+> 🚫 **commit message 禁止 `Co-Authored-By` 及任何 AI 署名行**，中文撰写。
 
 **维护者**：涵曦（<im.hanxi@gmail.com>）

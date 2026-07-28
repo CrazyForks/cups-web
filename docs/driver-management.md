@@ -93,15 +93,14 @@ runtime 镜像**没有 `dpkg-dev`**，所以：
 - 以 `Device:` 开块，块内每行按第一个 `=` 拆 key/value，未知 key 忽略——刻意宽容，某版本改了字段顺序或缩进也不会整体解析失败
 - **过滤裸 backend 行**：`lpinfo` 还会输出 backend 自身（`network socket` / `direct hp` / `ipp` / `lpd` / `beh` / `dnssd`…），这类行第二列不是完整 URI（**不含 `://`**），必须丢掉，否则会凭空多出 5~6 台"假打印机"；同时跳过 `cups-pdf` / `cups-brf` / `file:///dev/null` 等虚拟设备
 - **型号解析优先级（按可信度）**：`make-and-model` → `device-id` 的 `MFG`/`MDL`（含 `MANUFACTURER`/`MODEL` 长写法，并去掉型号里重复的厂商前缀）→ `info` → URI 路径（仅 `usb://厂商/型号` 能解析出来）。`splitMakeAndModel` 把 CUPS 填的 `Unknown` 等价于空；只有一个词时当型号处理
-- **空型号短路**：`findBestPPDFromModels` 里 `len(model) < 2` 直接返回空串（连"单字符解析残渣"一起挡掉）。挑不到 PPD 时 `setup` 就**不传 `-m`**，让 CUPS 走 driverless / IPP Everywhere——这是安全降级，比硬套一个无关 PPD 好得多
-- `checkHasDriver` 直接复用 `findBestPPDFromModels`：「能挑出 PPD」就是「已就绪」的定义，两处口径一致才不会出现"UI 显示已就绪、`lpadmin` 却挑不出 PPD"的割裂
-- `lpinfo -m` 输出可能几千行，整个检测过程**只取一次**（`listCUPSModels`），不为每台设备 fork 一个进程
+- **空型号短路**：打分引擎（`ppd_match.go::ScorePPDCandidates`）里 `len(compact) < 2` 时不产出任何非 generic 候选（连"单字符解析残渣"一起挡掉）。⚠️ **历史实现挑不到 PPD 时不传 `-m`，注释声称"让 CUPS 走 driverless / IPP Everywhere"——这是错的。** `lpadmin` 不传 `-m` 建的是 **raw 队列**（无 PPD），不是 IPP Everywhere。raw 队列拿不到 PPD 选项 → `/api/printer-info` 的 `mediaSourceSupported` 为空 → 前端进纸盒下拉消失。现在的实现：无候选且支持 driverless → 显式 `-m everywhere`；无候选且不支持 → **报错**，绝不静默建 raw
+- PPD 匹配走打分引擎（`ppd_match.go` 纯函数 + `ppd_query.go` 副作用层），`lpinfo -m` 走 TTL 10 分钟缓存（装卸驱动后显式失效）
 
 ## 一键设置（`/drivers/setup`）的步骤
 
-请求字段名以 `/detect` 的响应为准：`{deviceUri, driverName?, manufacturer?, model?}`（历史前端发的 `{uri, driverMatch, installDriver}` 与后端完全不匹配，这条主路径曾经 100% 返回 400）。
+请求字段名以 `/detect` 的响应为准：`{deviceUri, driverName?, manufacturer?, model?, deviceId?, ppdUri?, printerName?, allowRaw?}`。
 
-任务内部依次：驱动未装则 `driver-install`（以 `manifest.txt` 存在与否判断）→ 确定厂商/型号（URI 解析不出来时用请求里带来的 `manufacturer`/`model` 补全）→ `findBestPPD` → `sanitizePrinterName` 生成队列名 → `lpadmin -p <name> -E -v <uri> [-m <ppd>]` → `lpadmin -p <name> -o media=iso_a4_210x297mm`（国内默认 A4，失败只告警不影响整体成功）。
+任务内部依次：驱动未装则 `driver-install`（以 `manifest.txt` 存在与否判断）→ 确定厂商/型号（优先级：`req.Manufacturer/Model` → `parseDeviceID(deviceId)` → `parseDeviceURI(uri)`）→ **三态决策树**决定 `-m`（显式 `ppdUri` > `everywhere` > 自动 Top-1 > 报错）→ `uniquePrinterName` 去重队列名 → `lpadmin -p <name> -E -v <uri> [-m <ppd>]` → 默认 A4 → **验证**（`lpstat -p` + `lpoptions -l`，PPD 未生效时 `isNew` 队列回滚 `lpadmin -x`）。
 
 ## 异步任务模型（`driver_handlers.go`）
 

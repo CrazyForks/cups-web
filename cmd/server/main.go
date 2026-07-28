@@ -125,6 +125,7 @@ func main() {
 	admin.HandleFunc("/drivers/install", adminInstallDriverHandler).Methods("POST")
 	admin.HandleFunc("/drivers/remove", adminRemoveDriverHandler).Methods("POST")
 	admin.HandleFunc("/drivers/detect", adminDetectPrintersHandler).Methods("GET")
+	admin.HandleFunc("/drivers/ppds", adminListPPDCandidatesHandler).Methods("GET")
 	admin.HandleFunc("/drivers/upload", adminUploadDriverHandler).Methods("POST")
 	admin.HandleFunc("/drivers/setup", adminSetupPrinterHandler).Methods("POST")
 	// 驱动安装/卸载/一键设置改为异步任务（编译型驱动几分钟，会被全局
