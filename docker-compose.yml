@@ -40,6 +40,7 @@ services:
       # ⚠️ 删掉这个目录（或不挂这个卷）= 丢失所有手动安装的第三方驱动，
       # 重启后需要在 Web「驱动」页面重新安装一遍。
       - ./.drivers:/opt/cups-drivers/data
+      - /var/run/dbus:/var/run/dbus
       - /dev/bus/usb:/dev/bus/usb
       - /run/udev:/run/udev:ro
     device_cgroup_rules:

@@ -201,6 +201,7 @@ services:
       - ./.data:/data
       - ./.uploads:/uploads
       - ./.drivers:/opt/cups-drivers/data
+      - /var/run/dbus:/var/run/dbus
       - /dev/bus/usb:/dev/bus/usb
       - /run/udev:/run/udev:ro
     device_cgroup_rules:
@@ -368,6 +369,7 @@ Docker 默认卷映射：
 | --- | --- | --- |
 | `/dev/bus/usb` | `/dev/bus/usb` | 以**目录**方式挂载（而不是 `devices:`），这样打印机后开机时新建的设备节点能实时传播进容器 |
 | `/run/udev` | `/run/udev`（只读） | 让 libusb 读到设备属性，改善识别；宿主机没有该目录时可以删掉这一行 |
+| `/var/run/dbus` | `/var/run/dbus` | 共享宿主机的 D-Bus socket，让容器内的 CUPS 能通过宿主机的 avahi-daemon 广播 AirPrint 服务（[Issue #94](https://github.com/hanxi/cups-web/issues/94)）。需要宿主机安装并运行 `avahi-daemon`，详见 [AirPrint 搜不到打印机](#airprint-搜不到打印机) |
 
 ### 其他 compose 选项说明
 
@@ -477,6 +479,40 @@ docker compose up -d
 ### 打印机后开机就识别不到？（USB 热插拔）
 
 使用最新的 `docker-compose.yml`（volume 目录挂载 `/dev/bus/usb` + `device_cgroup_rules`）即可支持热插拔。若你的 Docker 环境不支持 `device_cgroup_rules`，改用 `privileged: true` 即可。
+
+### AirPrint 搜不到打印机？
+
+手机 / iPad 的 AirPrint 通过 mDNS（Bonjour）在局域网发现打印机。Docker 默认的 bridge 网络无法广播 mDNS 多播包，需要借助宿主机的 avahi-daemon 来广播（[Issue #94](https://github.com/hanxi/cups-web/issues/94)）。
+
+**方法一（推荐）：宿主机安装 avahi-daemon + 共享 D-Bus**
+
+1. 在宿主机上安装 avahi-daemon：
+   ```bash
+   # Debian / Ubuntu
+   sudo apt install avahi-daemon
+   sudo systemctl enable --now avahi-daemon
+   ```
+2. 确认 `docker-compose.yml` 中已挂载 D-Bus socket（最新版已包含）：
+   ```yaml
+   volumes:
+     - /var/run/dbus:/var/run/dbus
+   ```
+3. 重启容器：`docker compose up -d`
+
+原理：容器内的 CUPS 通过挂载的 D-Bus socket 与宿主机的 avahi-daemon 通信，由宿主机的 avahi 在局域网广播打印机服务，手机即可发现。
+
+**方法二：使用 host 网络模式**
+
+将 `docker-compose.yml` 改为 `network_mode: host`（删掉 `ports:` 配置）：
+```yaml
+services:
+  cups:
+    image: hanxi/cups-web:latest
+    network_mode: host
+    # ... 其他配置不变，删掉 ports 部分
+```
+
+容器直接使用宿主机网络栈，avahi 可以直接在局域网广播。缺点是无法自定义端口映射，CUPS 固定占用 631、Web 固定占用 8080。
 
 ### 安装的驱动丢失了？
 
