@@ -366,7 +366,7 @@ make docker-build   # AIO 镜像
 | **`./.drivers:/opt/cups-drivers/data`** | **驱动快照持久化**（删 = 重启丢驱动） |
 | `/dev/bus/usb:/dev/bus/usb` + `device_cgroup_rules` | USB 热插拔（issue #81） |
 | `/run/udev:/run/udev:ro` | libusb 设备属性（可选） |
-| `/var/run/dbus:/var/run/dbus` | 共享宿主机 D-Bus，让 CUPS 通过宿主机 avahi 广播 AirPrint（issue #94） |
+| `/run/dbus/system_bus_socket:/run/dbus/system_bus_socket` | 共享宿主机 D-Bus system bus socket，让 CUPS 通过宿主机 avahi 广播 AirPrint（issue #94） |
 
 ### Docker 构建
 

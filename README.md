@@ -201,7 +201,7 @@ services:
       - ./.data:/data
       - ./.uploads:/uploads
       - ./.drivers:/opt/cups-drivers/data
-      - /var/run/dbus:/var/run/dbus
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
       - /dev/bus/usb:/dev/bus/usb
       - /run/udev:/run/udev:ro
     device_cgroup_rules:
@@ -369,7 +369,7 @@ Docker 默认卷映射：
 | --- | --- | --- |
 | `/dev/bus/usb` | `/dev/bus/usb` | 以**目录**方式挂载（而不是 `devices:`），这样打印机后开机时新建的设备节点能实时传播进容器 |
 | `/run/udev` | `/run/udev`（只读） | 让 libusb 读到设备属性，改善识别；宿主机没有该目录时可以删掉这一行 |
-| `/var/run/dbus` | `/var/run/dbus` | 共享宿主机的 D-Bus socket，让容器内的 CUPS 能通过宿主机的 avahi-daemon 广播 AirPrint 服务（[Issue #94](https://github.com/hanxi/cups-web/issues/94)）。需要宿主机安装并运行 `avahi-daemon`，详见 [AirPrint 搜不到打印机](#airprint-搜不到打印机) |
+| `/run/dbus/system_bus_socket` | `/run/dbus/system_bus_socket` | 共享宿主机的 D-Bus system bus socket，让容器内的 CUPS 能通过宿主机的 avahi-daemon 广播 AirPrint 服务（[Issue #94](https://github.com/hanxi/cups-web/issues/94)）。需要宿主机安装并运行 `avahi-daemon`，详见 [AirPrint 搜不到打印机](#airprint-搜不到打印机) |
 
 ### 其他 compose 选项说明
 
@@ -495,7 +495,7 @@ docker compose up -d
 2. 确认 `docker-compose.yml` 中已挂载 D-Bus socket（最新版已包含）：
    ```yaml
    volumes:
-     - /var/run/dbus:/var/run/dbus
+     - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
    ```
 3. 重启容器：`docker compose up -d`
 
